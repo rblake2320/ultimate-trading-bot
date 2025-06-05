@@ -1,0 +1,87 @@
+{
+  "exchanges": {
+    "binance": {
+      "api_key": "YOUR_BINANCE_API_KEY",
+      "api_secret": "YOUR_BINANCE_API_SECRET",
+      "testnet": true,
+      "enabled": true
+    },
+    "robinhood": {
+      "api_key": "YOUR_ROBINHOOD_API_KEY",
+      "private_key": "YOUR_ROBINHOOD_PRIVATE_KEY",
+      "enabled": false
+    },
+    "coinbase": {
+      "api_key": "YOUR_COINBASE_API_KEY",
+      "api_secret": "YOUR_COINBASE_API_SECRET",
+      "passphrase": "YOUR_COINBASE_PASSPHRASE",
+      "enabled": false
+    }
+  },
+  "trading": {
+    "base_currency": "USDT",
+    "trading_pairs": ["BTC/USDT", "ETH/USDT", "BNB/USDT"],
+    "max_position_size": 0.1,
+    "stop_loss_percentage": 0.02,
+    "take_profit_percentage": 0.05,
+    "max_daily_loss": 0.05,
+    "max_open_positions": 5
+  },
+  "risk_management": {
+    "max_portfolio_risk": 0.02,
+    "position_sizing_method": "kelly",
+    "volatility_lookback": 20,
+    "correlation_threshold": 0.7,
+    "drawdown_limit": 0.1
+  },
+  "ml_models": {
+    "ensemble_threshold": 0.7,
+    "retrain_frequency": "daily",
+    "lookback_period": 100,
+    "features": {
+      "technical_indicators": true,
+      "sentiment_analysis": true,
+      "on_chain_metrics": true,
+      "macro_indicators": true
+    }
+  },
+  "data_sources": {
+    "market_data": {
+      "primary": "binance",
+      "backup": "coinbase"
+    },
+    "sentiment": {
+      "twitter_api_key": "YOUR_TWITTER_API_KEY",
+      "reddit_client_id": "YOUR_REDDIT_CLIENT_ID"
+    },
+    "on_chain": {
+      "glassnode_api_key": "YOUR_GLASSNODE_API_KEY"
+    }
+  },
+  "notifications": {
+    "telegram": {
+      "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+      "chat_id": "YOUR_TELEGRAM_CHAT_ID",
+      "enabled": false
+    },
+    "email": {
+      "smtp_server": "smtp.gmail.com",
+      "smtp_port": 587,
+      "username": "your_email@gmail.com",
+      "password": "your_app_password",
+      "enabled": false
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/trading_bot.log",
+    "max_size": "10MB",
+    "backup_count": 5
+  },
+  "database": {
+    "type": "sqlite",
+    "path": "data/trading_bot.db",
+    "backup_frequency": "daily"
+  }
+}
+
