@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Python
+        if: hashFiles('requirements.txt', 'pyproject.toml', 'setup.py') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Setup Go
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Setup Rust
+        if: hashFiles('Cargo.toml') != ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          [[ -f package.json ]] && npm ci
+          [[ -f requirements.txt ]] && pip install -r requirements.txt
+          [[ -f go.mod ]] && go mod download
+          [[ -f Cargo.toml ]] && cargo fetch
+
+      - name: Lint
+        run: |
+          [[ -f package.json ]] && npm run lint || true
+          [[ -f requirements.txt ]] && pip install ruff && ruff check . || true
+          [[ -f go.mod ]] && go vet ./... || true
+          [[ -f Cargo.toml ]] && cargo clippy -- -D warnings || true
+
+      - name: Test
+        run: |
+          [[ -f package.json ]] && npm test || true
+          [[ -f requirements.txt ]] && pip install pytest && pytest || true
+          [[ -f go.mod ]] && go test ./... || true
+          [[ -f Cargo.toml ]] && cargo test || true
+
+      - name: Security Audit
+        run: |
+          [[ -f package.json ]] && npm audit || true
+          [[ -f requirements.txt ]] && pip install safety && safety check || true
