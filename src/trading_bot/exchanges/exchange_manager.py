@@ -2,8 +2,6 @@
 Exchange Manager - Handles connections to multiple exchanges
 """
 
-# mypy: ignore-errors
-
 import logging
 from typing import Dict, List, Optional
 import ccxt.async_support as ccxt

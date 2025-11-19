@@ -3,8 +3,6 @@ Ultimate AI-Powered Crypto Trading Bot
 Main entry point for the trading system
 """
 
-# mypy: ignore-errors
-
 import asyncio
 import logging
 from src.trading_bot.core import TradingBot

@@ -3,8 +3,6 @@ Core Trading Bot System Architecture
 Main trading bot class that orchestrates all components
 """
 
-# mypy: ignore-errors
-
 import asyncio
 import logging
 from typing import Dict

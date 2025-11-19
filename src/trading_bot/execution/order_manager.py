@@ -2,8 +2,6 @@
 Order Manager - Handles order execution and management
 """
 
-# mypy: ignore-errors
-
 import logging
 from typing import Dict, List, Optional
 from datetime import datetime

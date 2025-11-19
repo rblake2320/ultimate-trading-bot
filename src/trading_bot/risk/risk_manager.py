@@ -2,8 +2,6 @@
 Risk Manager - Advanced risk management and position sizing
 """
 
-# mypy: ignore-errors
-
 import asyncio
 import logging
 import numpy as np
