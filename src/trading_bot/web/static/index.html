@@ -100,6 +100,12 @@
   <span id="updated">connecting…</span>
 </header>
 
+<section style="margin-top:0">
+  <h2>Live Market <span id="marketMeta" style="text-transform:none;letter-spacing:0"></span></h2>
+  <div class="grid" id="marketGrid"></div>
+</section>
+
+<section>
 <div class="grid">
   <div class="card"><div class="label">Equity</div><div class="value" id="equity">—</div></div>
   <div class="card"><div class="label">Cash</div><div class="value" id="cash">—</div></div>
@@ -110,6 +116,7 @@
   <div class="card"><div class="label">Win Rate</div><div class="value" id="winRate">—</div></div>
   <div class="card"><div class="label">Total Fees</div><div class="value" id="fees">—</div></div>
 </div>
+</section>
 
 <section>
   <h2>Equity Curve</h2>
@@ -144,13 +151,54 @@
   </div>
 </section>
 
-<footer>paper-first · risk-gated · journal-backed — refresh every 5s</footer>
+<footer>paper-first · risk-gated · journal-backed — market ticks 3s · state 5s</footer>
 
 <script>
 const fmt = (v, d = 2) =>
   v == null || isNaN(v) ? "—" :
   Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 const cls = v => (v > 0 ? "pos" : v < 0 ? "neg" : "");
+
+const REGIME_LABEL = {
+  trending_up: ["▲ trend", "pos"], trending_down: ["▼ trend", "neg"],
+  ranging: ["◆ range", ""], high_volatility: ["⚡ high vol", "neg"],
+};
+
+async function refreshMarket() {
+  try {
+    const market = await fetch("/api/market").then(r => r.json());
+    const grid = document.getElementById("marketGrid");
+    if (!market.length) {
+      grid.innerHTML = '<div class="card"><div class="label">Market</div>' +
+        '<div class="value" style="font-size:14px;color:var(--muted)">journal view — start the bot for live prices</div></div>';
+      return;
+    }
+    document.getElementById("marketMeta").textContent =
+      "· " + (market[0].exchange || "") + " · real-time";
+    grid.innerHTML = "";
+    for (const m of market) {
+      if (m.error) {
+        grid.insertAdjacentHTML("beforeend",
+          `<div class="card"><div class="label">${m.symbol}</div>
+           <div class="value neg" style="font-size:13px">${m.error}</div></div>`);
+        continue;
+      }
+      const chg = m.change_24h_pct;
+      const [rl, rc] = REGIME_LABEL[m.regime] || ["", ""];
+      grid.insertAdjacentHTML("beforeend",
+        `<div class="card">
+           <div class="label">${m.symbol}
+             <span class="${rc}" style="float:right">${rl}</span></div>
+           <div class="value">$${fmt(m.price, m.price < 10 ? 4 : 2)}</div>
+           <div style="font-size:12px;margin-top:2px" class="${cls(chg)}">
+             ${chg == null ? "" : (chg >= 0 ? "+" : "") + fmt(chg, 2) + "% 24h"}
+             <span style="color:var(--muted);float:right">
+               ${m.bid ? fmt(m.bid, 2) + " / " + fmt(m.ask, 2) : ""}</span>
+           </div>
+         </div>`);
+    }
+  } catch (e) { /* next tick retries */ }
+}
 
 let chart;
 function drawChart(points) {
@@ -250,7 +298,9 @@ async function refresh() {
   }
 }
 refresh();
+refreshMarket();
 setInterval(refresh, 5000);
+setInterval(refreshMarket, 3000);
 </script>
 </body>
 </html>

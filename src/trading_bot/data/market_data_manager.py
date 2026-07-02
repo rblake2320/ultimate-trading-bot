@@ -62,6 +62,7 @@ class MarketDataManager:
         self._owns_exchange = exchange is None
         self._candles: Dict[Tuple[str, str], pd.DataFrame] = {}
         self._tickers: Dict[str, Tuple[float, float]] = {}  # symbol -> (price, mono)
+        self._summaries: Dict[str, Tuple[dict, float]] = {}  # symbol -> (data, mono)
         self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
@@ -190,6 +191,56 @@ class MarketDataManager:
         self._tickers[symbol] = (price, now)
         return price
 
+    @staticmethod
+    def _summarize(symbol: str, ticker: dict) -> dict:
+        last = ticker.get("last") or ticker.get("close")
+        pct = ticker.get("percentage")
+        if pct is None and ticker.get("open") and last:
+            pct = (float(last) / float(ticker["open"]) - 1.0) * 100.0
+        return {
+            "symbol": symbol,
+            "price": float(last) if last else None,
+            "change_24h_pct": float(pct) if pct is not None else None,
+            "bid": float(ticker["bid"]) if ticker.get("bid") else None,
+            "ask": float(ticker["ask"]) if ticker.get("ask") else None,
+            "volume_24h": (
+                float(ticker["baseVolume"]) if ticker.get("baseVolume") else None
+            ),
+        }
+
+    async def get_ticker_summary(self, symbol: str, ttl: float = 5.0) -> dict:
+        """Live market snapshot for display: price, 24h change, bid/ask.
+
+        Cached for `ttl` seconds so dashboard polling never queues up
+        behind the exchange rate limiter."""
+        now = time.monotonic()
+        cached = self._summaries.get(symbol)
+        if cached and now - cached[1] < ttl:
+            return cached[0]
+        summary = self._summarize(symbol, await self._exchange.fetch_ticker(symbol))
+        self._summaries[symbol] = (summary, now)
+        return summary
+
+    async def get_ticker_summaries(self, symbols: List[str]) -> List[dict]:
+        """Summaries for many symbols in ONE exchange call where supported
+        (fetch_tickers), falling back to per-symbol requests."""
+        now = time.monotonic()
+        try:
+            tickers = await self._exchange.fetch_tickers(symbols)
+            out = []
+            for symbol in symbols:
+                ticker = tickers.get(symbol)
+                if ticker is None:
+                    continue
+                summary = self._summarize(symbol, ticker)
+                self._summaries[symbol] = (summary, now)
+                out.append(summary)
+            if out:
+                return out
+        except Exception as exc:  # noqa: BLE001 - not all venues batch tickers
+            logger.debug("fetch_tickers unsupported/failed (%s) — per-symbol", exc)
+        return [await self.get_ticker_summary(s) for s in symbols]
+
     async def get_spread(self, symbol: str) -> Optional[float]:
         """Relative bid/ask spread, if the exchange reports both sides."""
         ticker = await self._exchange.fetch_ticker(symbol)
@@ -205,6 +256,10 @@ class MarketDataManager:
         except Exception as exc:  # noqa: BLE001 - report any connectivity issue
             logger.warning("Market data health check failed: %s", exc)
             return False
+
+    def cached_candles(self, symbol: str, timeframe: Optional[str] = None):
+        """Last cached candle frame without a network round-trip (or None)."""
+        return self._candles.get((symbol, timeframe or self.timeframe))
 
     @property
     def markets(self) -> dict:

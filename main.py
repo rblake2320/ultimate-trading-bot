@@ -153,6 +153,23 @@ async def cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_keygen(args: argparse.Namespace) -> int:
+    """Generate an Ed25519 keypair for the Robinhood Crypto API."""
+    from src.trading_bot.exchanges.robinhood_crypto import generate_keypair
+
+    pair = generate_keypair()
+    print("Robinhood Crypto API keypair (Ed25519):")
+    print()
+    print("  PUBLIC key  (register at robinhood.com -> Crypto -> API):")
+    print(f"    {pair['public_key_b64']}")
+    print()
+    print("  PRIVATE key (keep secret — set as env var, never commit):")
+    print(f"    ROBINHOOD_PRIVATE_KEY={pair['private_key_b64']}")
+    print()
+    print("After registering, Robinhood issues an API key -> set ROBINHOOD_API_KEY.")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     db_path = config["journal"]["db_path"]
@@ -216,6 +233,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dash = sub.add_parser("dashboard", help="serve the web dashboard (journal view)")
     p_dash.add_argument("--port", type=int, default=None)
+
+    sub.add_parser("keygen", help="generate Ed25519 keypair for Robinhood Crypto API")
     return parser
 
 
@@ -231,6 +250,8 @@ def main() -> int:
         return asyncio.run(cmd_fetch(args))
     if command == "dashboard":
         return asyncio.run(cmd_dashboard(args))
+    if command == "keygen":
+        return cmd_keygen(args)
     if command == "status":
         return cmd_status(args)
     parser.print_help()

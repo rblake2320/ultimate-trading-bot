@@ -39,10 +39,18 @@ prices** as the default mode.
   time-boxed and fail-open: if the model is slow or down, the quantitative
   decision stands.
 - **Web dashboard** — starts with the bot at `http://127.0.0.1:8899`:
-  live equity curve, cash/PnL/drawdown, open positions with stops,
-  recent trades, and the event feed, auto-refreshing every 5 seconds.
-  Zero extra dependencies (served by aiohttp). `python main.py dashboard`
-  serves a standalone journal view when the bot isn't running.
+  a live market panel (real-time prices, 24h change, bid/ask, and the
+  detected regime per symbol, ticking every 3s from the exchange), the
+  equity curve, cash/PnL/drawdown, open positions with stops, recent
+  trades, and the event feed. Zero extra dependencies (served by
+  aiohttp). `python main.py dashboard` serves a standalone journal view
+  when the bot isn't running.
+- **Broker connectivity** — any of ccxt's 100+ exchanges by config, plus
+  a native **Robinhood Crypto** adapter (Ed25519-signed official API;
+  `python main.py keygen` generates the keypair). Robinhood's stock-side
+  *Agentic Trading* MCP, Alpaca (stocks + paper), Coinbase for Agents,
+  and Kraken's MCP tooling are mapped out in
+  [docs/CONNECTIVITY.md](docs/CONNECTIVITY.md).
 - **Ops** — SQLite trade journal (orders, trades, equity snapshots,
   events), Telegram/Discord notifications, `KILL`-file kill switch,
   emergency close-all, stale-order reaping, health checks.

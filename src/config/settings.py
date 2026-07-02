@@ -166,7 +166,16 @@ def validate_config(config: Dict[str, Any]) -> None:
 
     if mode == "live":
         exchange = config["exchange"]
-        if not exchange.get("api_key") or not exchange.get("api_secret"):
+        if exchange.get("id") == "robinhood":
+            if not (
+                os.getenv("ROBINHOOD_API_KEY") and os.getenv("ROBINHOOD_PRIVATE_KEY")
+            ):
+                raise ValueError(
+                    "live robinhood mode requires ROBINHOOD_API_KEY and "
+                    "ROBINHOOD_PRIVATE_KEY in the environment "
+                    "(generate a keypair with 'python main.py keygen')"
+                )
+        elif not exchange.get("api_key") or not exchange.get("api_secret"):
             raise ValueError(
                 "live mode requires exchange.api_key and exchange.api_secret "
                 "(set EXCHANGE_API_KEY / EXCHANGE_API_SECRET)"

@@ -77,3 +77,37 @@ async def test_trades_endpoint(dash):
 async def test_events_endpoint(dash):
     events = await _get("/api/events")
     assert any("test event line" in e["message"] for e in events)
+
+
+async def test_market_endpoint_empty_without_bot(dash):
+    # Journal-only mode has no live exchange attached.
+    assert await _get("/api/market") == []
+
+
+async def _get_status(path):
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"http://127.0.0.1:18765{path}") as resp:
+            return resp.status
+
+
+async def test_bad_limit_returns_400_not_500(dash):
+    for path in ("/api/equity", "/api/trades", "/api/events"):
+        assert await _get_status(f"{path}?limit=abc") == 400, path
+        assert await _get_status(f"{path}?limit=3.5") == 400, path
+
+
+async def test_empty_and_extreme_limits_are_safe(dash):
+    # Empty -> default; negative/oversized -> clamped; all 200.
+    assert await _get_status("/api/equity?limit=") == 200
+    assert await _get_status("/api/equity?limit=-5") == 200
+    assert await _get_status("/api/equity?limit=999999999") == 200
+    assert len(await _get("/api/equity?limit=-5")) <= 1 + 1  # clamped to >=1
+
+
+async def test_equity_limit_returns_most_recent_ascending(dash):
+    # Fixture wrote 10000 then 10150. limit=1 must return the LATEST point.
+    points = await _get("/api/equity?limit=1")
+    assert len(points) == 1
+    assert points[0]["equity"] == pytest.approx(10_150.0)

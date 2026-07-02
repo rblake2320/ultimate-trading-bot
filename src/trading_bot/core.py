@@ -56,6 +56,7 @@ class TradingBot:
         self._last_candle_ts: Dict[str, Optional[pd.Timestamp]] = {
             s: None for s in self.symbols
         }
+        self._market_cache: list = []
 
         # Components are wired in setup() because live/paper differ.
         self.exchange_manager: Optional[ExchangeManager] = None
@@ -85,18 +86,33 @@ class TradingBot:
                     f"{LIVE_ENV_VAR}={LIVE_ENV_VALUE}. Refusing to start. "
                     f"(Run in paper mode first — it uses real market data.)"
                 )
-            self.exchange_manager = ExchangeManager(
-                {exchange_id: {**exchange_cfg, "enabled": True}}
-            )
-            await self.exchange_manager.initialize()
-            exchange = self.exchange_manager.primary
-            self.data = MarketDataManager(
-                exchange_id=exchange_id,
-                timeframe=self.timeframe,
-                exchange=exchange,
-            )
-            await self.data.initialize()
-            broker = LiveBroker(exchange)
+            if exchange_id == "robinhood":
+                # Robinhood Crypto: native adapter (not in ccxt). It has no
+                # candle API, so market data streams from a ccxt venue.
+                from .exchanges.robinhood_crypto import RobinhoodCryptoBroker
+
+                broker = RobinhoodCryptoBroker(
+                    api_key=os.getenv("ROBINHOOD_API_KEY", ""),
+                    private_key_b64=os.getenv("ROBINHOOD_PRIVATE_KEY", ""),
+                )
+                data_id = exchange_cfg.get("data_id", "kraken")
+                self.data = MarketDataManager(
+                    exchange_id=data_id, timeframe=self.timeframe
+                )
+                await self.data.initialize()
+            else:
+                self.exchange_manager = ExchangeManager(
+                    {exchange_id: {**exchange_cfg, "enabled": True}}
+                )
+                await self.exchange_manager.initialize()
+                exchange = self.exchange_manager.primary
+                self.data = MarketDataManager(
+                    exchange_id=exchange_id,
+                    timeframe=self.timeframe,
+                    exchange=exchange,
+                )
+                await self.data.initialize()
+                broker = LiveBroker(exchange)
             balances = await broker.fetch_balances()
             starting_cash = balances.get(self.quote_currency, 0.0)
             logger.warning(
@@ -174,6 +190,7 @@ class TradingBot:
             asyncio.create_task(self._candle_loop(), name="candles"),
             asyncio.create_task(self._position_loop(), name="positions"),
             asyncio.create_task(self._maintenance_loop(), name="maintenance"),
+            asyncio.create_task(self._market_loop(), name="market"),
         ]
         try:
             await asyncio.gather(*tasks)
@@ -395,6 +412,33 @@ class TradingBot:
             self.is_running = False
 
     # ------------------------------------------------------------------ #
+
+    async def _market_loop(self) -> None:
+        """Continuously refresh the dashboard's market snapshot in the
+        background so /api/market answers instantly from cache instead of
+        queueing behind the exchange rate limiter."""
+        from .strategies.base import infer_regime
+
+        while self.is_running:
+            try:
+                summaries = await self.data.get_ticker_summaries(self.symbols)
+                for summary in summaries:
+                    cached = self.data.cached_candles(summary["symbol"])
+                    if cached is not None and len(cached) > 50:
+                        try:
+                            summary["regime"] = infer_regime(cached).value
+                        except Exception:  # noqa: BLE001
+                            summary["regime"] = None
+                    summary["exchange"] = self.data.exchange_id
+                    summary["timeframe"] = self.timeframe
+                self._market_cache = summaries
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Market snapshot refresh failed: %s", exc)
+            await asyncio.sleep(5)
+
+    async def market_snapshot(self) -> list:
+        """Latest cached per-symbol market view (refreshed by _market_loop)."""
+        return self._market_cache
 
     async def status(self) -> Dict:
         prices = {}
