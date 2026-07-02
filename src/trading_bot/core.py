@@ -68,6 +68,7 @@ class TradingBot:
         self.journal = TradeJournal(
             config.get("journal", {}).get("db_path", "data/trading_bot.db")
         )
+        self.dashboard = None
 
     # ------------------------------------------------------------------ #
     # Wiring
@@ -147,6 +148,24 @@ class TradingBot:
     async def run(self) -> None:
         await self.setup()
         self.is_running = True
+
+        dash_cfg = self.config.get("dashboard", {})
+        if dash_cfg.get("enabled", True):
+            from .web.dashboard import Dashboard
+
+            self.dashboard = Dashboard(
+                journal=self.journal,
+                bot=self,
+                host=dash_cfg.get("host", "127.0.0.1"),
+                port=int(dash_cfg.get("port", 8080)),
+            )
+            try:
+                url = await self.dashboard.start()
+                logger.info("Dashboard: %s", url)
+            except OSError as exc:
+                logger.warning("Dashboard failed to start (port busy?): %s", exc)
+                self.dashboard = None
+
         await self.notify.send(
             f"Trading bot started ({self.mode}) — {', '.join(self.symbols)} "
             f"on {self.timeframe} candles. Channels: {self.notify.channels}"
@@ -175,6 +194,8 @@ class TradingBot:
 
     async def _cleanup(self) -> None:
         try:
+            if self.dashboard:
+                await self.dashboard.stop()
             if self.orders:
                 await self.orders.cancel_all()
         finally:

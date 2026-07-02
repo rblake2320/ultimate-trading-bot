@@ -127,6 +127,32 @@ async def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the dashboard standalone (journal-only view)."""
+    config = load_config(args.config)
+    setup_logging(config)
+    from src.trading_bot.web.dashboard import Dashboard
+
+    journal = TradeJournal(config["journal"]["db_path"])
+    dash_cfg = config.get("dashboard", {})
+    dashboard = Dashboard(
+        journal=journal,
+        host=dash_cfg.get("host", "127.0.0.1"),
+        port=int(args.port or dash_cfg.get("port", 8080)),
+    )
+    url = await dashboard.start()
+    print(f"Dashboard: {url}  (Ctrl+C to stop)")
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await dashboard.stop()
+        journal.close()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     db_path = config["journal"]["db_path"]
@@ -187,6 +213,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch.add_argument("--exchange", default=None, help="history source override")
 
     sub.add_parser("status", help="show journal performance summary")
+
+    p_dash = sub.add_parser("dashboard", help="serve the web dashboard (journal view)")
+    p_dash.add_argument("--port", type=int, default=None)
     return parser
 
 
@@ -200,6 +229,8 @@ def main() -> int:
         return asyncio.run(cmd_backtest(args))
     if command == "fetch":
         return asyncio.run(cmd_fetch(args))
+    if command == "dashboard":
+        return asyncio.run(cmd_dashboard(args))
     if command == "status":
         return cmd_status(args)
     parser.print_help()

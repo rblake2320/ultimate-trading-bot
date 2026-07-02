@@ -51,5 +51,6 @@
     "discord": { "enabled": false, "webhook_url": "" }
   },
   "journal": { "db_path": "data/trading_bot.db" },
+  "dashboard": { "enabled": true, "host": "127.0.0.1", "port": 8899 },
   "logging": { "level": "INFO", "file": "logs/trading_bot.log" }
 }

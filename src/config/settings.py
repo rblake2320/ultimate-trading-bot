@@ -73,6 +73,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "discord": {"enabled": False, "webhook_url": ""},
     },
     "journal": {"db_path": "data/trading_bot.db"},
+    "dashboard": {"enabled": True, "host": "127.0.0.1", "port": 8899},
     "logging": {"level": "INFO", "file": "logs/trading_bot.log"},
 }
 

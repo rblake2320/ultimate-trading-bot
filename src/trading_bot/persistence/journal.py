@@ -169,6 +169,24 @@ class TradeJournal:
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
 
+    def equity_history(self, limit: int = 500) -> List[Dict]:
+        cur = self._conn.execute(
+            """SELECT timestamp, equity, cash, open_positions
+               FROM equity_snapshots ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
+        return list(reversed(rows))
+
+    def recent_events(self, limit: int = 50) -> List[Dict]:
+        cur = self._conn.execute(
+            "SELECT timestamp, level, message FROM events ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
+
     def performance_summary(self) -> Dict[str, float]:
         cur = self._conn.execute(
             """SELECT COUNT(*),

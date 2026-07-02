@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ultimate Trading Bot</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #12161f;
+    --panel2: #171c27;
+    --border: #232a38;
+    --text: #d7dde8;
+    --muted: #6b7689;
+    --green: #2fd08c;
+    --red: #ff5c74;
+    --amber: #ffb454;
+    --accent: #5ca7ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    padding: 24px;
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    margin-bottom: 20px; padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  h1 { font-size: 18px; font-weight: 600; letter-spacing: .04em; }
+  h1 .tick { color: var(--green); }
+  .pill {
+    font-size: 11px; padding: 3px 10px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted);
+    text-transform: uppercase; letter-spacing: .1em;
+  }
+  .pill.live   { color: var(--green); border-color: var(--green); }
+  .pill.paper  { color: var(--amber); border-color: var(--amber); }
+  .pill.halted { color: var(--red);   border-color: var(--red); }
+  #updated { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .card .label {
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .12em; margin-bottom: 6px;
+  }
+  .card .value { font-size: 22px; font-weight: 600; }
+  .value.pos { color: var(--green); }
+  .value.neg { color: var(--red); }
+
+  section { margin-top: 22px; }
+  section > h2 {
+    font-size: 12px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .14em; margin-bottom: 10px;
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px;
+  }
+  #equityChartWrap { height: 260px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: right; padding: 7px 10px; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th {
+    color: var(--muted); font-weight: 500; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .1em;
+    border-bottom: 1px solid var(--border);
+  }
+  tbody tr:nth-child(odd) { background: var(--panel2); }
+  td.pos { color: var(--green); }
+  td.neg { color: var(--red); }
+  .empty { color: var(--muted); padding: 18px; text-align: center; }
+
+  .cols { display: grid; gap: 14px; grid-template-columns: 3fr 2fr; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  #events { max-height: 300px; overflow-y: auto; font-size: 12px; }
+  #events div { padding: 4px 6px; border-bottom: 1px solid var(--border); }
+  #events .ts { color: var(--muted); margin-right: 8px; }
+  #events .critical, #events .error { color: var(--red); }
+  #events .warning { color: var(--amber); }
+  footer { margin-top: 26px; color: var(--muted); font-size: 11px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="tick">▲</span> ULTIMATE TRADING BOT</h1>
+  <span id="mode" class="pill">…</span>
+  <span id="halt" class="pill" style="display:none">HALTED</span>
+  <span id="updated">connecting…</span>
+</header>
+
+<div class="grid">
+  <div class="card"><div class="label">Equity</div><div class="value" id="equity">—</div></div>
+  <div class="card"><div class="label">Cash</div><div class="value" id="cash">—</div></div>
+  <div class="card"><div class="label">Daily P&amp;L</div><div class="value" id="dailyPnl">—</div></div>
+  <div class="card"><div class="label">Drawdown</div><div class="value" id="drawdown">—</div></div>
+  <div class="card"><div class="label">Open Positions</div><div class="value" id="posCount">—</div></div>
+  <div class="card"><div class="label">Closed Trades</div><div class="value" id="tradeCount">—</div></div>
+  <div class="card"><div class="label">Win Rate</div><div class="value" id="winRate">—</div></div>
+  <div class="card"><div class="label">Total Fees</div><div class="value" id="fees">—</div></div>
+</div>
+
+<section>
+  <h2>Equity Curve</h2>
+  <div class="panel" id="equityChartWrap"><canvas id="equityChart"></canvas></div>
+</section>
+
+<section>
+  <h2>Open Positions</h2>
+  <div class="panel">
+    <table id="positionsTable">
+      <thead><tr><th>Symbol</th><th>Size</th><th>Entry</th><th>Stop</th><th>Target</th><th>Unrealized</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="empty" id="positionsEmpty">no open positions</div>
+  </div>
+</section>
+
+<section class="cols">
+  <div>
+    <h2>Recent Trades</h2>
+    <div class="panel">
+      <table id="tradesTable">
+        <thead><tr><th>Closed</th><th>Symbol</th><th>Size</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Reason</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="tradesEmpty">no closed trades yet</div>
+    </div>
+  </div>
+  <div>
+    <h2>Events</h2>
+    <div class="panel" id="events"><div class="empty">no events</div></div>
+  </div>
+</section>
+
+<footer>paper-first · risk-gated · journal-backed — refresh every 5s</footer>
+
+<script>
+const fmt = (v, d = 2) =>
+  v == null || isNaN(v) ? "—" :
+  Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const cls = v => (v > 0 ? "pos" : v < 0 ? "neg" : "");
+
+let chart;
+function drawChart(points) {
+  const ctx = document.getElementById("equityChart");
+  const labels = points.map(p => p.timestamp.slice(5, 16).replace("T", " "));
+  const data = points.map(p => p.equity);
+  if (!chart) {
+    chart = new Chart(ctx, {
+      type: "line",
+      data: { labels, datasets: [{
+        data, borderColor: "#5ca7ff", borderWidth: 1.5,
+        backgroundColor: "rgba(92,167,255,.08)", fill: true,
+        pointRadius: 0, tension: 0.25,
+      }]},
+      options: {
+        animation: false, responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: "#6b7689", maxTicksLimit: 8 }, grid: { color: "#1a2030" } },
+          y: { ticks: { color: "#6b7689" }, grid: { color: "#1a2030" } },
+        },
+      },
+    });
+  } else {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = data;
+    chart.update("none");
+  }
+}
+
+async function refresh() {
+  try {
+    const [status, equity, trades, events] = await Promise.all([
+      fetch("/api/status").then(r => r.json()),
+      fetch("/api/equity?limit=500").then(r => r.json()),
+      fetch("/api/trades?limit=25").then(r => r.json()),
+      fetch("/api/events?limit=40").then(r => r.json()),
+    ]);
+
+    const mode = document.getElementById("mode");
+    mode.textContent = status.mode + (status.running ? " · running" : " · stopped");
+    mode.className = "pill " + (status.mode === "live" ? "live" : "paper");
+
+    const risk = status.risk || {};
+    document.getElementById("halt").style.display = risk.halted ? "" : "none";
+    document.getElementById("equity").textContent = "$" + fmt(status.equity ?? risk.equity);
+    document.getElementById("cash").textContent = "$" + fmt(status.cash);
+    const dp = document.getElementById("dailyPnl");
+    dp.textContent = (risk.daily_pnl >= 0 ? "+" : "") + fmt(risk.daily_pnl);
+    dp.className = "value " + cls(risk.daily_pnl);
+    document.getElementById("drawdown").textContent =
+      risk.drawdown != null ? fmt(risk.drawdown * 100, 1) + "%" : "—";
+
+    const pf = status.portfolio || {};
+    const positions = status.positions || {};
+    document.getElementById("posCount").textContent = Object.keys(positions).length;
+    document.getElementById("tradeCount").textContent = pf.closed_trades ?? pf.trades ?? "—";
+    document.getElementById("winRate").textContent =
+      pf.win_rate != null ? fmt(pf.win_rate * 100, 1) + "%" : "—";
+    document.getElementById("fees").textContent = "$" + fmt(pf.total_fees ?? pf.fees);
+
+    const ptb = document.querySelector("#positionsTable tbody");
+    ptb.innerHTML = "";
+    const psyms = Object.keys(positions);
+    document.getElementById("positionsEmpty").style.display = psyms.length ? "none" : "";
+    for (const s of psyms) {
+      const p = positions[s];
+      ptb.insertAdjacentHTML("beforeend",
+        `<tr><td>${s}</td><td>${fmt(p.size, 6)}</td><td>${fmt(p.entry)}</td>
+         <td>${fmt(p.stop)}</td><td>${fmt(p.target)}</td>
+         <td class="${cls(p.unrealized)}">${fmt(p.unrealized)}</td></tr>`);
+    }
+
+    const ttb = document.querySelector("#tradesTable tbody");
+    ttb.innerHTML = "";
+    document.getElementById("tradesEmpty").style.display = trades.length ? "none" : "";
+    for (const t of trades) {
+      ttb.insertAdjacentHTML("beforeend",
+        `<tr><td>${(t.closed_at || "").slice(0, 16).replace("T", " ")}</td>
+         <td>${t.symbol}</td><td>${fmt(t.size, 6)}</td><td>${fmt(t.entry_price)}</td>
+         <td>${fmt(t.exit_price)}</td><td class="${cls(t.pnl)}">${fmt(t.pnl)}</td>
+         <td>${t.exit_reason || ""}</td></tr>`);
+    }
+
+    const ev = document.getElementById("events");
+    ev.innerHTML = events.length ? "" : '<div class="empty">no events</div>';
+    for (const e of events) {
+      ev.insertAdjacentHTML("beforeend",
+        `<div class="${e.level}"><span class="ts">${(e.timestamp || "").slice(5, 19).replace("T", " ")}</span>${e.message}</div>`);
+    }
+
+    if (equity.length) drawChart(equity);
+    document.getElementById("updated").textContent =
+      "updated " + new Date().toLocaleTimeString();
+  } catch (err) {
+    document.getElementById("updated").textContent = "connection lost — retrying";
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
