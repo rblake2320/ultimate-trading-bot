@@ -115,7 +115,7 @@ class Backtester:
         all_ts = sorted(set().union(*[df.index for df in data.values()]))
         equity_points: List[Tuple[pd.Timestamp, float]] = []
 
-        for t_idx, ts in enumerate(all_ts):
+        for ts in all_ts:
             # ---- 1. execute previous-bar decisions at this bar's open ----
             for symbol, df in data.items():
                 if ts not in df.index:

@@ -25,8 +25,8 @@ from pathlib import Path
 
 from src.config.settings import load_config
 from src.trading_bot.backtest.backtester import (
-    Backtester,
     BacktestConfig,
+    Backtester,
 )
 from src.trading_bot.core import TradingBot
 from src.trading_bot.data.market_data_manager import MarketDataManager

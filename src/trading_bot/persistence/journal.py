@@ -167,7 +167,7 @@ class TradeJournal:
             "SELECT * FROM trades ORDER BY closed_at DESC LIMIT ?", (limit,)
         )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
 
     def performance_summary(self) -> Dict[str, float]:
         cur = self._conn.execute(

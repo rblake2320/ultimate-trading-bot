@@ -135,6 +135,7 @@ config.json
 logs/
 data/
 !tests/data/
+!src/trading_bot/data/
 !tests/data/*.csv
 backtest_results/
 .secrets/

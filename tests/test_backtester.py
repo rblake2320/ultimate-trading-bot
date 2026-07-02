@@ -9,8 +9,8 @@ import pandas as pd
 import pytest
 
 from src.trading_bot.backtest.backtester import (
-    Backtester,
     BacktestConfig,
+    Backtester,
     compute_metrics,
     infer_bars_per_year,
     walk_forward_splits,
@@ -55,7 +55,7 @@ def test_no_lookahead(btc_df):
         if t.closed_at <= cutoff and t.exit_reason != "end_of_backtest"
     ]
     assert len(short_trades) == len(full_trades)
-    for a, b in zip(short_trades, full_trades):
+    for a, b in zip(short_trades, full_trades, strict=True):
         assert a.opened_at == b.opened_at
         assert a.entry_price == pytest.approx(b.entry_price)
         assert a.pnl == pytest.approx(b.pnl)
