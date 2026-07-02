@@ -38,6 +38,11 @@ prices** as the default mode.
   context via local Ollama (private) or the Anthropic API. Strictly
   time-boxed and fail-open: if the model is slow or down, the quantitative
   decision stands.
+- **Web dashboard** — starts with the bot at `http://127.0.0.1:8899`:
+  live equity curve, cash/PnL/drawdown, open positions with stops,
+  recent trades, and the event feed, auto-refreshing every 5 seconds.
+  Zero extra dependencies (served by aiohttp). `python main.py dashboard`
+  serves a standalone journal view when the bot isn't running.
 - **Ops** — SQLite trade journal (orders, trades, equity snapshots,
   events), Telegram/Discord notifications, `KILL`-file kill switch,
   emergency close-all, stale-order reaping, health checks.
@@ -61,7 +66,8 @@ git clone https://github.com/rblake2320/ultimate-trading-bot.git
 cd ultimate-trading-bot
 pip install -r requirements.txt
 
-# Paper-trade BTC/ETH/SOL on Kraken live data (no API keys needed):
+# Paper-trade BTC/ETH/SOL on Kraken live data (no API keys needed).
+# The live dashboard comes up at http://127.0.0.1:8899
 python main.py trade
 
 # Backtest the ensemble on real history (Binance.US serves deep history):
@@ -114,6 +120,7 @@ src/trading_bot/
   portfolio/portfolio_manager.py positions, PnL, equity
   backtest/backtester.py     event-driven, fees + vol-scaled slippage, walk-forward
   persistence/journal.py     SQLite journal
+  web/dashboard.py           live browser dashboard (aiohttp + Chart.js)
   notifications/             Telegram / Discord / log
 tests/                       real-data test suite (committed 400d of 1h OHLCV)
 ```
