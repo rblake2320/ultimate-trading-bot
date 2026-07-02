@@ -1,436 +1,400 @@
-"""
-Core Trading Bot System Architecture
-Main trading bot class that orchestrates all components
+"""Core trading engine.
+
+Orchestrates: market data -> prediction engine -> risk engine -> execution
+-> portfolio/journal, with layered safety controls:
+
+  - Paper mode is the default. Live mode requires BOTH ``mode: "live"`` in
+    the config AND the environment variable ``TRADING_BOT_LIVE=YES`` — a
+    two-key launch so a config typo can't trade real money.
+  - Kill switch: creating a file named ``KILL`` next to the bot (or the
+    path in config ``kill_file``) triggers an emergency shutdown.
+  - The risk engine can halt entries at any time (daily loss, drawdown,
+    stoploss guard, consecutive losses); exits are never blocked.
 """
 
-# mypy: ignore-errors
+from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict
-from datetime import datetime
+import os
+from pathlib import Path
+from typing import Dict, Optional
 
-from .exchanges.exchange_manager import ExchangeManager
+import pandas as pd
+
 from .data.market_data_manager import MarketDataManager
+from .exchanges.exchange_manager import ExchangeManager
+from .execution.brokers import LiveBroker, OrderManager, PaperBroker
 from .ml.prediction_engine import PredictionEngine
-from .risk.risk_manager import RiskManager
-from .execution.order_manager import OrderManager
-from .portfolio.portfolio_manager import PortfolioManager
+from .models import OrderSide, OrderStatus, OrderType, SignalAction
 from .notifications.notification_manager import NotificationManager
+from .persistence.journal import TradeJournal
+from .portfolio.portfolio_manager import PortfolioManager
+from .risk.risk_manager import RiskManager
+
+logger = logging.getLogger(__name__)
+
+LIVE_ENV_VAR = "TRADING_BOT_LIVE"
+LIVE_ENV_VALUE = "YES"
 
 
 class TradingBot:
-    """
-    Main trading bot class that coordinates all trading operations
-    """
-
     def __init__(self, config: Dict):
-        """Initialize the trading bot with configuration"""
         self.config = config
-        self.logger = logging.getLogger(__name__)
+        self.mode = config.get("mode", "paper")
+        trading = config.get("trading", {})
+        self.symbols = list(trading.get("symbols", ["BTC/USD"]))
+        self.timeframe = trading.get("timeframe", "1h")
+        self.poll_seconds = float(trading.get("poll_seconds", 30))
+        self.price_check_seconds = float(trading.get("price_check_seconds", 10))
+        self.max_open_positions = int(trading.get("max_open_positions", 4))
+        self.trailing_stop_pct = float(trading.get("trailing_stop_pct", 0.0))
+        self.quote_currency = trading.get("quote_currency", "USD")
+        self.kill_file = Path(config.get("kill_file", "KILL"))
+
         self.is_running = False
-        self.start_time = None
+        self._last_candle_ts: Dict[str, Optional[pd.Timestamp]] = {
+            s: None for s in self.symbols
+        }
 
-        # Initialize core components
-        self.exchange_manager = ExchangeManager(config["exchanges"])
-        self.market_data_manager = MarketDataManager(config["data_sources"])
-        self.prediction_engine = PredictionEngine(config["ml_models"])
-        self.risk_manager = RiskManager(config["risk_management"])
-        self.order_manager = OrderManager(config["trading"])
-        self.portfolio_manager = PortfolioManager(config["trading"])
-        self.notification_manager = NotificationManager(config["notifications"])
+        # Components are wired in setup() because live/paper differ.
+        self.exchange_manager: Optional[ExchangeManager] = None
+        self.data: Optional[MarketDataManager] = None
+        self.orders: Optional[OrderManager] = None
+        self.portfolio: Optional[PortfolioManager] = None
+        self.risk = RiskManager(config.get("risk"))
+        self.engine = PredictionEngine(config.get("signals"))
+        self.notify = NotificationManager(config.get("notifications"))
+        self.journal = TradeJournal(
+            config.get("journal", {}).get("db_path", "data/trading_bot.db")
+        )
 
-        # Trading state
-        self.active_positions = {}
-        self.pending_orders = {}
-        self.daily_pnl = 0.0
-        self.total_pnl = 0.0
+    # ------------------------------------------------------------------ #
+    # Wiring
+    # ------------------------------------------------------------------ #
 
-    async def initialize(self):
-        """Initialize all components and connections"""
-        self.logger.info("Initializing trading bot...")
+    async def setup(self) -> None:
+        exchange_cfg = self.config.get("exchange", {})
+        exchange_id = exchange_cfg.get("id", "kraken")
 
-        try:
-            # Initialize exchanges
+        if self.mode == "live":
+            if os.getenv(LIVE_ENV_VAR) != LIVE_ENV_VALUE:
+                raise RuntimeError(
+                    f"Live mode requires the environment variable "
+                    f"{LIVE_ENV_VAR}={LIVE_ENV_VALUE}. Refusing to start. "
+                    f"(Run in paper mode first — it uses real market data.)"
+                )
+            self.exchange_manager = ExchangeManager(
+                {exchange_id: {**exchange_cfg, "enabled": True}}
+            )
             await self.exchange_manager.initialize()
+            exchange = self.exchange_manager.primary
+            self.data = MarketDataManager(
+                exchange_id=exchange_id,
+                timeframe=self.timeframe,
+                exchange=exchange,
+            )
+            await self.data.initialize()
+            broker = LiveBroker(exchange)
+            balances = await broker.fetch_balances()
+            starting_cash = balances.get(self.quote_currency, 0.0)
+            logger.warning(
+                "LIVE TRADING ENABLED on %s — %s balance: %.2f %s",
+                exchange_id,
+                self.quote_currency,
+                starting_cash,
+                self.quote_currency,
+            )
+        else:
+            self.data = MarketDataManager(
+                exchange_id=exchange_id, timeframe=self.timeframe
+            )
+            await self.data.initialize()
+            starting_cash = float(
+                self.config.get("trading", {}).get("paper_starting_cash", 10_000.0)
+            )
+            broker = PaperBroker(
+                self.data,
+                starting_balances={self.quote_currency: starting_cash},
+                taker_fee=float(exchange_cfg.get("taker_fee", 0.0026)),
+                maker_fee=float(exchange_cfg.get("maker_fee", 0.0016)),
+            )
+            logger.info(
+                "Paper trading on %s live data with %.2f %s virtual balance",
+                exchange_id,
+                starting_cash,
+                self.quote_currency,
+            )
 
-            # Initialize market data feeds
-            await self.market_data_manager.initialize()
+        self.orders = OrderManager(
+            broker,
+            stale_after_seconds=float(
+                self.config.get("trading", {}).get("stale_order_seconds", 300)
+            ),
+        )
+        self.portfolio = PortfolioManager(
+            quote_currency=self.quote_currency, starting_cash=starting_cash
+        )
+        self.risk.update_equity(starting_cash)
+        self.journal.log_event(
+            "info", f"bot started mode={self.mode} symbols={self.symbols}"
+        )
 
-            # Load ML models
-            await self.prediction_engine.initialize()
+    # ------------------------------------------------------------------ #
+    # Main loop
+    # ------------------------------------------------------------------ #
 
-            # Initialize risk management
-            await self.risk_manager.initialize()
-
-            # Initialize portfolio tracking
-            await self.portfolio_manager.initialize()
-
-            self.logger.info("Trading bot initialized successfully")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Failed to initialize trading bot: {e}")
-            return False
-
-    async def run(self):
-        """Main trading loop"""
-        if not await self.initialize():
-            self.logger.error("Failed to initialize. Exiting.")
-            return
-
+    async def run(self) -> None:
+        await self.setup()
         self.is_running = True
-        self.start_time = datetime.now()
-
-        self.logger.info("Starting trading bot main loop...")
-
+        await self.notify.send(
+            f"Trading bot started ({self.mode}) — {', '.join(self.symbols)} "
+            f"on {self.timeframe} candles. Channels: {self.notify.channels}"
+        )
+        tasks = [
+            asyncio.create_task(self._candle_loop(), name="candles"),
+            asyncio.create_task(self._position_loop(), name="positions"),
+            asyncio.create_task(self._maintenance_loop(), name="maintenance"),
+        ]
         try:
-            # Start background tasks
-            tasks = [
-                asyncio.create_task(self._market_data_loop()),
-                asyncio.create_task(self._trading_loop()),
-                asyncio.create_task(self._risk_monitoring_loop()),
-                asyncio.create_task(self._portfolio_update_loop()),
-                asyncio.create_task(self._health_check_loop()),
-            ]
-
-            # Wait for all tasks
             await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.critical("Fatal error in trading loop: %s", exc, exc_info=True)
+            await self.emergency_shutdown(f"fatal error: {exc}")
+            raise
+        finally:
+            self.is_running = False
+            for task in tasks:
+                task.cancel()
+            await self._cleanup()
 
-        except Exception as e:
-            self.logger.error(f"Trading bot crashed: {e}")
-            await self.emergency_shutdown()
+    async def stop(self) -> None:
+        self.is_running = False
 
+    async def _cleanup(self) -> None:
+        try:
+            if self.orders:
+                await self.orders.cancel_all()
+        finally:
+            if self.data:
+                await self.data.close()
+            if self.exchange_manager:
+                await self.exchange_manager.close_all()
+            self.journal.log_event("info", "bot stopped")
+            self.journal.close()
+
+    # ------------------------------------------------------------------ #
+    # Loops
+    # ------------------------------------------------------------------ #
+
+    async def _candle_loop(self) -> None:
+        """Acts once per newly closed candle per symbol."""
+        while self.is_running:
+            try:
+                fresh: Dict[str, pd.DataFrame] = {}
+                for symbol in self.symbols:
+                    df = await self.data.get_candles(symbol)
+                    if df.empty:
+                        continue
+                    last_ts = df.index[-1]
+                    if self._last_candle_ts[symbol] != last_ts:
+                        self._last_candle_ts[symbol] = last_ts
+                        fresh[symbol] = df
+                        self.risk.update_returns(symbol, df["close"])
+                if fresh:
+                    signals = await self.engine.get_signals(fresh)
+                    for signal in signals:
+                        await self._handle_signal(signal, fresh[signal.symbol])
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Candle loop error: %s", exc, exc_info=True)
+            await asyncio.sleep(self.poll_seconds)
+
+    async def _position_loop(self) -> None:
+        """Stop-loss / take-profit / trailing-stop checks on live prices,
+        plus open-order polling."""
+        while self.is_running:
+            try:
+                if self.kill_file.exists():
+                    await self.emergency_shutdown("kill file detected")
+                    return
+
+                filled = await self.orders.poll_open_orders()
+                for order in filled:
+                    self._apply_fill(order)
+
+                for symbol in list(self.portfolio.positions):
+                    position = self.portfolio.positions[symbol]
+                    price = await self.data.get_current_price(symbol)
+                    position.high_water_mark = max(
+                        position.high_water_mark, price
+                    )
+                    if self.trailing_stop_pct > 0:
+                        trailed = position.high_water_mark * (
+                            1 - self.trailing_stop_pct
+                        )
+                        if position.stop_loss is None or trailed > position.stop_loss:
+                            position.stop_loss = trailed
+                    if position.stop_loss is not None and price <= position.stop_loss:
+                        await self._close_position(symbol, "stop_loss")
+                    elif (
+                        position.take_profit is not None
+                        and price >= position.take_profit
+                    ):
+                        await self._close_position(symbol, "take_profit")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Position loop error: %s", exc, exc_info=True)
+            await asyncio.sleep(self.price_check_seconds)
+
+    async def _maintenance_loop(self) -> None:
+        """Equity snapshots, health checks, risk-state logging."""
+        while self.is_running:
+            try:
+                prices = {}
+                for symbol in list(self.portfolio.positions):
+                    prices[symbol] = await self.data.get_current_price(symbol)
+                equity = self.portfolio.equity(prices)
+                self.risk.update_equity(equity)
+                self.journal.snapshot_equity(
+                    equity,
+                    cash=self.portfolio.cash,
+                    open_positions=len(self.portfolio.positions),
+                    details=self.risk.metrics(),
+                )
+                healthy = await self.data.health_check()
+                if not healthy:
+                    await self.notify.alert("Market data health check failed")
+                logger.info(
+                    "equity=%.2f cash=%.2f positions=%d daily_pnl=%.2f",
+                    equity,
+                    self.portfolio.cash,
+                    len(self.portfolio.positions),
+                    self.risk.state.daily_pnl,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Maintenance loop error: %s", exc)
+            await asyncio.sleep(300)
+
+    # ------------------------------------------------------------------ #
+    # Trade handling
+    # ------------------------------------------------------------------ #
+
+    async def _handle_signal(self, signal, df: pd.DataFrame) -> None:
+        if signal.action == SignalAction.BUY:
+            prices = {
+                s: await self.data.get_current_price(s)
+                for s in self.portfolio.positions
+            }
+            equity = self.portfolio.equity(prices)
+            decision = self.risk.evaluate_entry(
+                signal,
+                equity,
+                self.portfolio.open_notionals(prices),
+                atr=self.engine.latest_atr(df),
+                max_open_positions=self.max_open_positions,
+            )
+            if not decision.approved:
+                logger.info("Entry rejected [%s]: %s", signal.symbol, decision.reason)
+                return
+            order = await self.orders.submit(
+                signal.symbol,
+                OrderSide.BUY,
+                decision.quantity,
+                OrderType.MARKET,
+                reason=f"signal:{signal.strategy}",
+            )
+            self.journal.record_order(order)
+            if order.status == OrderStatus.FILLED:
+                self._apply_fill(order, stop=decision.stop_loss, target=decision.take_profit)
+                await self.notify.trade(
+                    f"BUY {signal.symbol} {order.filled:.6f} @ "
+                    f"{order.average_price:.2f} "
+                    f"(conf {signal.confidence:.2f}, "
+                    f"regime {signal.regime.value if signal.regime else '?'}, "
+                    f"SL {decision.stop_loss:.2f})"
+                )
+        elif signal.action in (SignalAction.SELL, SignalAction.CLOSE):
+            if signal.symbol in self.portfolio.positions:
+                await self._close_position(signal.symbol, f"signal:{signal.strategy}")
+
+    def _apply_fill(self, order, stop=None, target=None) -> None:
+        record = self.portfolio.apply_fill(order, strategy=order.reason)
+        self.journal.record_order(order)
+        if order.side == OrderSide.BUY and order.symbol in self.portfolio.positions:
+            position = self.portfolio.positions[order.symbol]
+            if stop is not None:
+                position.stop_loss = stop
+            if target is not None:
+                position.take_profit = target
+        if record is not None:
+            self.journal.record_trade(record)
+            self.risk.record_trade_result(
+                record, was_stop_loss="stop_loss" in record.exit_reason
+            )
+
+    async def _close_position(self, symbol: str, reason: str) -> None:
+        position = self.portfolio.positions.get(symbol)
+        if position is None:
+            return
+        order = await self.orders.submit(
+            symbol,
+            OrderSide.SELL,
+            position.size,
+            OrderType.MARKET,
+            reason=reason,
+        )
+        if order.status == OrderStatus.FILLED:
+            self._apply_fill(order)
+            pnl_msg = ""
+            if self.portfolio.closed_trades:
+                last = self.portfolio.closed_trades[-1]
+                if last.symbol == symbol:
+                    pnl_msg = f" pnl={last.pnl:+.2f}"
+            await self.notify.trade(f"CLOSE {symbol} ({reason}){pnl_msg}")
+        else:
+            await self.notify.alert(
+                f"Failed to close {symbol}: order {order.status.value} — {order.reason}"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Emergency
+    # ------------------------------------------------------------------ #
+
+    async def emergency_shutdown(self, reason: str) -> None:
+        logger.critical("EMERGENCY SHUTDOWN: %s", reason)
+        self.journal.log_event("critical", f"emergency shutdown: {reason}")
+        try:
+            await self.orders.cancel_all()
+            if self.config.get("trading", {}).get("emergency_close_positions", True):
+                for symbol in list(self.portfolio.positions):
+                    await self._close_position(symbol, "emergency")
+            await self.notify.emergency(f"Bot shut down: {reason}")
         finally:
             self.is_running = False
 
-    async def _market_data_loop(self):
-        """Continuous market data processing"""
-        while self.is_running:
-            try:
-                # Get latest market data
-                market_data = await self.market_data_manager.get_latest_data()
-
-                # Update prediction models with new data
-                await self.prediction_engine.update_data(market_data)
-
-                # Update risk calculations
-                await self.risk_manager.update_market_data(market_data)
-
-                await asyncio.sleep(1)  # 1 second update frequency
-
-            except Exception as e:
-                self.logger.error(f"Error in market data loop: {e}")
-                await asyncio.sleep(5)
-
-    async def _trading_loop(self):
-        """Main trading decision loop"""
-        while self.is_running:
-            try:
-                # Get trading signals from ML models
-                signals = await self.prediction_engine.get_signals()
-
-                # Process each signal
-                for signal in signals:
-                    await self._process_trading_signal(signal)
-
-                # Check existing positions
-                await self._manage_existing_positions()
-
-                await asyncio.sleep(10)  # 10 second trading frequency
-
-            except Exception as e:
-                self.logger.error(f"Error in trading loop: {e}")
-                await asyncio.sleep(30)
-
-    async def _process_trading_signal(self, signal: Dict):
-        """Process a trading signal from the ML models"""
-        try:
-            symbol = signal["symbol"]
-            action = signal["action"]  # 'buy', 'sell', 'hold'
-            confidence = signal["confidence"]
-            price = signal["price"]
-
-            # Check if signal meets confidence threshold
-            if confidence < self.config["ml_models"]["ensemble_threshold"]:
-                return
-
-            # Risk assessment
-            risk_assessment = await self.risk_manager.assess_trade(signal)
-            if not risk_assessment["approved"]:
-                self.logger.info(
-                    f"Trade rejected by risk manager: {risk_assessment['reason']}"
-                )
-                return
-
-            # Calculate position size
-            position_size = await self.risk_manager.calculate_position_size(signal)
-
-            # Execute trade
-            if action == "buy":
-                await self._execute_buy_order(symbol, position_size, price)
-            elif action == "sell":
-                await self._execute_sell_order(symbol, position_size, price)
-
-        except Exception as e:
-            self.logger.error(f"Error processing trading signal: {e}")
-
-    async def _execute_buy_order(self, symbol: str, size: float, price: float):
-        """Execute a buy order"""
-        try:
-            order = await self.order_manager.place_buy_order(
-                symbol=symbol, size=size, price=price, order_type="limit"
-            )
-
-            if order:
-                self.pending_orders[order["id"]] = order
-                self.logger.info(f"Buy order placed: {symbol} {size} @ {price}")
-
-                # Send notification
-                await self.notification_manager.send_trade_notification(
-                    f"Buy order placed: {symbol} {size} @ {price}"
-                )
-
-        except Exception as e:
-            self.logger.error(f"Error executing buy order: {e}")
-
-    async def _execute_sell_order(self, symbol: str, size: float, price: float):
-        """Execute a sell order"""
-        try:
-            order = await self.order_manager.place_sell_order(
-                symbol=symbol, size=size, price=price, order_type="limit"
-            )
-
-            if order:
-                self.pending_orders[order["id"]] = order
-                self.logger.info(f"Sell order placed: {symbol} {size} @ {price}")
-
-                # Send notification
-                await self.notification_manager.send_trade_notification(
-                    f"Sell order placed: {symbol} {size} @ {price}"
-                )
-
-        except Exception as e:
-            self.logger.error(f"Error executing sell order: {e}")
-
-    async def _manage_existing_positions(self):
-        """Manage existing positions and orders"""
-        try:
-            # Check pending orders
-            for order_id, order in list(self.pending_orders.items()):
-                status = await self.order_manager.get_order_status(order_id)
-
-                if status["status"] == "filled":
-                    # Order filled, update positions
-                    await self._handle_filled_order(order, status)
-                    del self.pending_orders[order_id]
-
-                elif status["status"] == "cancelled":
-                    # Order cancelled
-                    del self.pending_orders[order_id]
-
-            # Check stop losses and take profits
-            for symbol, position in self.active_positions.items():
-                await self._check_position_exits(symbol, position)
-
-        except Exception as e:
-            self.logger.error(f"Error managing positions: {e}")
-
-    async def _handle_filled_order(self, order: Dict, status: Dict):
-        """Handle a filled order"""
-        try:
-            symbol = order["symbol"]
-            side = order["side"]
-            size = status["filled_size"]
-            price = status["average_price"]
-
-            if side == "buy":
-                # Add to positions
-                if symbol in self.active_positions:
-                    # Average down
-                    existing = self.active_positions[symbol]
-                    total_size = existing["size"] + size
-                    avg_price = (
-                        existing["size"] * existing["entry_price"] + size * price
-                    ) / total_size
-
-                    self.active_positions[symbol] = {
-                        "size": total_size,
-                        "entry_price": avg_price,
-                        "side": "long",
-                        "timestamp": datetime.now(),
-                    }
-                else:
-                    self.active_positions[symbol] = {
-                        "size": size,
-                        "entry_price": price,
-                        "side": "long",
-                        "timestamp": datetime.now(),
-                    }
-
-            elif side == "sell":
-                # Reduce or close position
-                if symbol in self.active_positions:
-                    existing = self.active_positions[symbol]
-                    if existing["size"] <= size:
-                        # Close position
-                        pnl = (price - existing["entry_price"]) * existing["size"]
-                        self.daily_pnl += pnl
-                        self.total_pnl += pnl
-                        del self.active_positions[symbol]
-
-                        self.logger.info(f"Position closed: {symbol} PnL: {pnl:.2f}")
-                    else:
-                        # Partial close
-                        self.active_positions[symbol]["size"] -= size
-                        pnl = (price - existing["entry_price"]) * size
-                        self.daily_pnl += pnl
-                        self.total_pnl += pnl
-
-            # Update portfolio
-            await self.portfolio_manager.update_position(
-                symbol, self.active_positions.get(symbol)
-            )
-
-        except Exception as e:
-            self.logger.error(f"Error handling filled order: {e}")
-
-    async def _check_position_exits(self, symbol: str, position: Dict):
-        """Check if position should be closed (stop loss/take profit)"""
-        try:
-            current_price = await self.market_data_manager.get_current_price(symbol)
-            entry_price = position["entry_price"]
-
-            # Calculate P&L percentage
-            pnl_pct = (current_price - entry_price) / entry_price
-
-            # Check stop loss
-            stop_loss_pct = self.config["trading"]["stop_loss_percentage"]
-            if pnl_pct <= -stop_loss_pct:
-                await self._close_position(symbol, position, "stop_loss")
-                return
-
-            # Check take profit
-            take_profit_pct = self.config["trading"]["take_profit_percentage"]
-            if pnl_pct >= take_profit_pct:
-                await self._close_position(symbol, position, "take_profit")
-                return
-
-        except Exception as e:
-            self.logger.error(f"Error checking position exits: {e}")
-
-    async def _close_position(self, symbol: str, position: Dict, reason: str):
-        """Close a position"""
-        try:
-            current_price = await self.market_data_manager.get_current_price(symbol)
-
-            order = await self.order_manager.place_sell_order(
-                symbol=symbol,
-                size=position["size"],
-                price=current_price,
-                order_type="market",
-            )
-
-            if order:
-                self.logger.info(f"Position closed: {symbol} Reason: {reason}")
-
-                # Send notification
-                await self.notification_manager.send_trade_notification(
-                    f"Position closed: {symbol} Reason: {reason}"
-                )
-
-        except Exception as e:
-            self.logger.error(f"Error closing position: {e}")
-
-    async def _risk_monitoring_loop(self):
-        """Continuous risk monitoring"""
-        while self.is_running:
-            try:
-                # Check daily loss limits
-                max_daily_loss = self.config["trading"]["max_daily_loss"]
-                if self.daily_pnl <= -max_daily_loss:
-                    await self.emergency_shutdown("Daily loss limit exceeded")
-                    break
-
-                # Check portfolio risk
-                portfolio_risk = await self.risk_manager.calculate_portfolio_risk()
-                max_portfolio_risk = self.config["risk_management"][
-                    "max_portfolio_risk"
-                ]
-
-                if portfolio_risk > max_portfolio_risk:
-                    await self._reduce_portfolio_risk()
-
-                await asyncio.sleep(60)  # Check every minute
-
-            except Exception as e:
-                self.logger.error(f"Error in risk monitoring: {e}")
-                await asyncio.sleep(60)
-
-    async def _portfolio_update_loop(self):
-        """Update portfolio metrics"""
-        while self.is_running:
-            try:
-                await self.portfolio_manager.update_metrics()
-                await asyncio.sleep(300)  # Update every 5 minutes
-
-            except Exception as e:
-                self.logger.error(f"Error updating portfolio: {e}")
-                await asyncio.sleep(300)
-
-    async def _health_check_loop(self):
-        """System health monitoring"""
-        while self.is_running:
-            try:
-                # Check exchange connections
-                await self.exchange_manager.health_check()
-
-                # Check data feeds
-                await self.market_data_manager.health_check()
-
-                # Log system status
-                uptime = datetime.now() - self.start_time
-                self.logger.info(f"System healthy. Uptime: {uptime}")
-
-                await asyncio.sleep(300)  # Check every 5 minutes
-
-            except Exception as e:
-                self.logger.error(f"Health check failed: {e}")
-                await asyncio.sleep(60)
-
-    async def emergency_shutdown(self, reason: str = "Emergency shutdown"):
-        """Emergency shutdown procedure"""
-        self.logger.critical(f"EMERGENCY SHUTDOWN: {reason}")
-
-        try:
-            # Cancel all pending orders
-            for order_id in self.pending_orders:
-                await self.order_manager.cancel_order(order_id)
-
-            # Close all positions (optional - depends on strategy)
-            # for symbol, position in self.active_positions.items():
-            #     await self._close_position(symbol, position, 'emergency')
-
-            # Send emergency notification
-            await self.notification_manager.send_emergency_notification(
-                f"Trading bot emergency shutdown: {reason}"
-            )
-
-            self.is_running = False
-
-        except Exception as e:
-            self.logger.error(f"Error during emergency shutdown: {e}")
-
-    async def get_status(self) -> Dict:
-        """Get current bot status"""
+    # ------------------------------------------------------------------ #
+
+    async def status(self) -> Dict:
+        prices = {}
+        for symbol in list(self.portfolio.positions):
+            prices[symbol] = await self.data.get_current_price(symbol)
         return {
-            "is_running": self.is_running,
-            "uptime": (
-                str(datetime.now() - self.start_time) if self.start_time else None
-            ),
-            "active_positions": len(self.active_positions),
-            "pending_orders": len(self.pending_orders),
-            "daily_pnl": self.daily_pnl,
-            "total_pnl": self.total_pnl,
-            "portfolio_value": await self.portfolio_manager.get_total_value(),
+            "mode": self.mode,
+            "running": self.is_running,
+            "equity": self.portfolio.equity(prices),
+            "cash": self.portfolio.cash,
+            "positions": {
+                s: {
+                    "size": p.size,
+                    "entry": p.entry_price,
+                    "stop": p.stop_loss,
+                    "target": p.take_profit,
+                    "unrealized": p.unrealized_pnl(prices.get(s, p.entry_price)),
+                }
+                for s, p in self.portfolio.positions.items()
+            },
+            "risk": self.risk.metrics(),
+            "orders": self.orders.stats(),
+            "portfolio": self.portfolio.stats(),
         }

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Unit tests (offline, real committed market data)
+        run: pytest -m "not integration" -q
+      - name: Integration tests (live exchange public APIs)
+        # Public endpoints, no keys. Kraken occasionally rate-limits CI
+        # runners, so this step is advisory rather than blocking.
+        run: pytest -m integration -q || echo "::warning::live integration tests failed (network)"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check src/ main.py tests/

@@ -1,87 +1,55 @@
 {
-  "exchanges": {
-    "binance": {
-      "api_key": "YOUR_BINANCE_API_KEY",
-      "api_secret": "YOUR_BINANCE_API_SECRET",
-      "testnet": true,
-      "enabled": true
-    },
-    "robinhood": {
-      "api_key": "YOUR_ROBINHOOD_API_KEY",
-      "private_key": "YOUR_ROBINHOOD_PRIVATE_KEY",
-      "enabled": false
-    },
-    "coinbase": {
-      "api_key": "YOUR_COINBASE_API_KEY",
-      "api_secret": "YOUR_COINBASE_API_SECRET",
-      "passphrase": "YOUR_COINBASE_PASSPHRASE",
-      "enabled": false
-    }
+  "mode": "paper",
+  "exchange": {
+    "id": "kraken",
+    "testnet": false,
+    "taker_fee": 0.0026,
+    "maker_fee": 0.0016
   },
   "trading": {
-    "base_currency": "USDT",
-    "trading_pairs": ["BTC/USDT", "ETH/USDT", "BNB/USDT"],
-    "max_position_size": 0.1,
-    "stop_loss_percentage": 0.02,
-    "take_profit_percentage": 0.05,
-    "max_daily_loss": 0.05,
-    "max_open_positions": 5
+    "quote_currency": "USD",
+    "symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+    "timeframe": "1h",
+    "poll_seconds": 30,
+    "price_check_seconds": 10,
+    "max_open_positions": 4,
+    "paper_starting_cash": 10000.0,
+    "trailing_stop_pct": 0.0,
+    "stale_order_seconds": 300,
+    "emergency_close_positions": true
   },
-  "risk_management": {
-    "max_portfolio_risk": 0.02,
-    "position_sizing_method": "kelly",
-    "volatility_lookback": 20,
-    "correlation_threshold": 0.7,
-    "drawdown_limit": 0.1
+  "risk": {
+    "risk_per_trade": 0.0075,
+    "max_position_pct": 0.2,
+    "max_portfolio_heat": 0.05,
+    "kelly_fraction": 0.5,
+    "max_daily_loss_pct": 0.03,
+    "max_drawdown_pct": 0.15,
+    "stoploss_guard_count": 4,
+    "stoploss_guard_window_hours": 24,
+    "max_consecutive_losses": 5,
+    "halt_cooldown_hours": 12,
+    "reentry_cooldown_minutes": 60,
+    "correlation_threshold": 0.85,
+    "min_notional": 10.0
   },
-  "ml_models": {
-    "ensemble_threshold": 0.7,
-    "retrain_frequency": "daily",
-    "lookback_period": 100,
-    "features": {
-      "technical_indicators": true,
-      "sentiment_analysis": true,
-      "on_chain_metrics": true,
-      "macro_indicators": true
-    }
-  },
-  "data_sources": {
-    "market_data": {
-      "primary": "binance",
-      "backup": "coinbase"
-    },
-    "sentiment": {
-      "twitter_api_key": "YOUR_TWITTER_API_KEY",
-      "reddit_client_id": "YOUR_REDDIT_CLIENT_ID"
-    },
-    "on_chain": {
-      "glassnode_api_key": "YOUR_GLASSNODE_API_KEY"
+  "signals": {
+    "strategy": "ensemble",
+    "strategy_params": {},
+    "min_confidence": 0.55,
+    "llm_analyst": {
+      "enabled": false,
+      "provider": "ollama",
+      "model": "gemma4:latest",
+      "ollama_url": "http://localhost:11434",
+      "timeout_seconds": 20,
+      "min_veto_confidence": 0.6
     }
   },
   "notifications": {
-    "telegram": {
-      "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
-      "chat_id": "YOUR_TELEGRAM_CHAT_ID",
-      "enabled": false
-    },
-    "email": {
-      "smtp_server": "smtp.gmail.com",
-      "smtp_port": 587,
-      "username": "your_email@gmail.com",
-      "password": "your_app_password",
-      "enabled": false
-    }
+    "telegram": { "enabled": false, "bot_token": "", "chat_id": "" },
+    "discord": { "enabled": false, "webhook_url": "" }
   },
-  "logging": {
-    "level": "INFO",
-    "file": "logs/trading_bot.log",
-    "max_size": "10MB",
-    "backup_count": 5
-  },
-  "database": {
-    "type": "sqlite",
-    "path": "data/trading_bot.db",
-    "backup_frequency": "daily"
-  }
+  "journal": { "db_path": "data/trading_bot.db" },
+  "logging": { "level": "INFO", "file": "logs/trading_bot.log" }
 }
-

@@ -134,6 +134,8 @@ config.json
 *.pem
 logs/
 data/
+!tests/data/
+!tests/data/*.csv
 backtest_results/
 .secrets/
 api_keys.json
@@ -160,3 +162,4 @@ Thumbs.db
 temp/
 tmp/
 
+KILL

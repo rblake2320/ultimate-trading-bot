@@ -1,109 +1,172 @@
+"""Configuration loading and validation.
+
+Precedence: environment variables > config.json > built-in defaults.
+Secrets (API keys, tokens) should live in the environment or a .env file,
+never in config.json.
 """
-Configuration management for the trading bot
-"""
+
+from __future__ import annotations
 
 import json
-import os
-from typing import Dict, Any
 import logging
+import os
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict
 
-def load_config(config_path: str = "config.json") -> Dict[str, Any]:
-    """
-    Load configuration from JSON file
-    
-    Args:
-        config_path: Path to configuration file
-        
-    Returns:
-        Configuration dictionary
-    """
-    try:
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Configuration file not found: {config_path}")
-        
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        
-        # Validate required sections
-        required_sections = [
-            'exchanges', 'trading', 'risk_management', 
-            'ml_models', 'data_sources', 'notifications'
-        ]
-        
-        for section in required_sections:
-            if section not in config:
-                raise ValueError(f"Missing required configuration section: {section}")
-        
-        # Load environment variables for sensitive data
-        config = _load_environment_variables(config)
-        
-        return config
-        
-    except Exception as e:
-        logging.error(f"Error loading configuration: {e}")
-        raise
+logger = logging.getLogger(__name__)
 
-def _load_environment_variables(config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Load sensitive configuration from environment variables
-    """
-    # Exchange API keys
-    for exchange_name, exchange_config in config['exchanges'].items():
-        if 'api_key' in exchange_config:
-            env_key = f"{exchange_name.upper()}_API_KEY"
-            if os.getenv(env_key):
-                exchange_config['api_key'] = os.getenv(env_key)
-        
-        if 'api_secret' in exchange_config:
-            env_secret = f"{exchange_name.upper()}_API_SECRET"
-            if os.getenv(env_secret):
-                exchange_config['api_secret'] = os.getenv(env_secret)
-    
-    # Notification tokens
-    if 'telegram' in config['notifications']:
-        if os.getenv('TELEGRAM_BOT_TOKEN'):
-            config['notifications']['telegram']['bot_token'] = os.getenv('TELEGRAM_BOT_TOKEN')
-        if os.getenv('TELEGRAM_CHAT_ID'):
-            config['notifications']['telegram']['chat_id'] = os.getenv('TELEGRAM_CHAT_ID')
-    
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "mode": "paper",
+    "kill_file": "KILL",
+    "exchange": {
+        "id": "kraken",
+        "api_key": "",
+        "api_secret": "",
+        "password": "",
+        "testnet": False,
+        "taker_fee": 0.0026,
+        "maker_fee": 0.0016,
+    },
+    "trading": {
+        "quote_currency": "USD",
+        "symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+        "timeframe": "1h",
+        "poll_seconds": 30,
+        "price_check_seconds": 10,
+        "max_open_positions": 4,
+        "paper_starting_cash": 10000.0,
+        "trailing_stop_pct": 0.0,
+        "stale_order_seconds": 300,
+        "emergency_close_positions": True,
+    },
+    "risk": {
+        "risk_per_trade": 0.0075,
+        "max_position_pct": 0.20,
+        "max_portfolio_heat": 0.05,
+        "kelly_fraction": 0.5,
+        "max_daily_loss_pct": 0.03,
+        "max_drawdown_pct": 0.15,
+        "stoploss_guard_count": 4,
+        "stoploss_guard_window_hours": 24,
+        "max_consecutive_losses": 5,
+        "halt_cooldown_hours": 12,
+        "reentry_cooldown_minutes": 60,
+        "correlation_threshold": 0.85,
+        "min_notional": 10.0,
+    },
+    "signals": {
+        "strategy": "ensemble",
+        "strategy_params": {},
+        "min_confidence": 0.55,
+        "llm_analyst": {
+            "enabled": False,
+            "provider": "ollama",
+            "model": "gemma4:latest",
+            "ollama_url": "http://localhost:11434",
+            "timeout_seconds": 20,
+            "min_veto_confidence": 0.6,
+        },
+    },
+    "notifications": {
+        "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
+        "discord": {"enabled": False, "webhook_url": ""},
+    },
+    "journal": {"db_path": "data/trading_bot.db"},
+    "logging": {"level": "INFO", "file": "logs/trading_bot.log"},
+}
+
+# Environment overrides: VAR -> (config path, cast)
+ENV_OVERRIDES = {
+    "EXCHANGE_ID": (("exchange", "id"), str),
+    "EXCHANGE_API_KEY": (("exchange", "api_key"), str),
+    "EXCHANGE_API_SECRET": (("exchange", "api_secret"), str),
+    "EXCHANGE_PASSWORD": (("exchange", "password"), str),
+    "TELEGRAM_BOT_TOKEN": (("notifications", "telegram", "bot_token"), str),
+    "TELEGRAM_CHAT_ID": (("notifications", "telegram", "chat_id"), str),
+    "DISCORD_WEBHOOK_URL": (("notifications", "discord", "webhook_url"), str),
+    "TRADING_MODE": (("mode",), str),
+}
+
+
+def _deep_merge(base: Dict, override: Dict) -> Dict:
+    out = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = deepcopy(value)
+    return out
+
+
+def _apply_env(config: Dict) -> Dict:
+    for var, (path, cast) in ENV_OVERRIDES.items():
+        raw = os.getenv(var)
+        if raw is None or raw == "":
+            continue
+        node = config
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = cast(raw)
+    # Auto-enable notification channels when their secrets are present.
+    tg = config["notifications"]["telegram"]
+    if tg.get("bot_token") and tg.get("chat_id"):
+        tg["enabled"] = True
+    dc = config["notifications"]["discord"]
+    if dc.get("webhook_url"):
+        dc["enabled"] = True
     return config
 
-def validate_config(config: Dict[str, Any]) -> bool:
-    """
-    Validate configuration parameters
-    
-    Args:
-        config: Configuration dictionary
-        
-    Returns:
-        True if valid, raises exception if invalid
-    """
-    # Validate trading parameters
-    trading_config = config['trading']
-    
-    if trading_config['max_position_size'] <= 0 or trading_config['max_position_size'] > 1:
-        raise ValueError("max_position_size must be between 0 and 1")
-    
-    if trading_config['stop_loss_percentage'] <= 0:
-        raise ValueError("stop_loss_percentage must be positive")
-    
-    if trading_config['take_profit_percentage'] <= 0:
-        raise ValueError("take_profit_percentage must be positive")
-    
-    # Validate risk management
-    risk_config = config['risk_management']
-    
-    if risk_config['max_portfolio_risk'] <= 0 or risk_config['max_portfolio_risk'] > 1:
-        raise ValueError("max_portfolio_risk must be between 0 and 1")
-    
-    if risk_config['drawdown_limit'] <= 0 or risk_config['drawdown_limit'] > 1:
-        raise ValueError("drawdown_limit must be between 0 and 1")
-    
-    # Validate ML models
-    ml_config = config['ml_models']
-    
-    if ml_config['ensemble_threshold'] <= 0 or ml_config['ensemble_threshold'] > 1:
-        raise ValueError("ensemble_threshold must be between 0 and 1")
-    
-    return True
 
+def load_config(config_path: str = "config.json") -> Dict[str, Any]:
+    """Load config with defaults; a missing file just means defaults."""
+    config = deepcopy(DEFAULT_CONFIG)
+    path = Path(config_path)
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as fh:
+            user_config = json.load(fh)
+        config = _deep_merge(config, user_config)
+        logger.info("Loaded config from %s", path)
+    else:
+        logger.info("No %s found — using defaults (paper mode)", config_path)
+    config = _apply_env(config)
+    validate_config(config)
+    return config
+
+
+def validate_config(config: Dict[str, Any]) -> None:
+    mode = config.get("mode")
+    if mode not in ("paper", "live"):
+        raise ValueError(f"mode must be 'paper' or 'live', got {mode!r}")
+
+    trading = config["trading"]
+    if not trading.get("symbols"):
+        raise ValueError("trading.symbols must not be empty")
+    for symbol in trading["symbols"]:
+        if "/" not in symbol:
+            raise ValueError(f"symbol '{symbol}' must be BASE/QUOTE format")
+    if trading["max_open_positions"] < 1:
+        raise ValueError("trading.max_open_positions must be >= 1")
+
+    risk = config["risk"]
+    for key, low, high in [
+        ("risk_per_trade", 0.0, 0.05),
+        ("max_position_pct", 0.0, 1.0),
+        ("max_portfolio_heat", 0.0, 0.5),
+        ("kelly_fraction", 0.0, 1.0),
+        ("max_daily_loss_pct", 0.0, 0.5),
+        ("max_drawdown_pct", 0.0, 0.9),
+    ]:
+        value = risk[key]
+        if not (low < value <= high):
+            raise ValueError(
+                f"risk.{key} must be in ({low}, {high}], got {value}"
+            )
+
+    if mode == "live":
+        exchange = config["exchange"]
+        if not exchange.get("api_key") or not exchange.get("api_secret"):
+            raise ValueError(
+                "live mode requires exchange.api_key and exchange.api_secret "
+                "(set EXCHANGE_API_KEY / EXCHANGE_API_SECRET)"
+            )

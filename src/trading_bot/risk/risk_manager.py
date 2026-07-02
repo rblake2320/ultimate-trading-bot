@@ -1,526 +1,343 @@
-"""
-Risk Manager - Advanced risk management and position sizing
+"""Risk engine: position sizing, protections, and portfolio-level limits.
+
+Sizing model (per trade):
+  1. Risk budget = equity * risk_per_trade (default 0.75%).
+  2. Quantity = risk budget / stop distance (signal's stop, else k*ATR).
+  3. Caps applied in order: max position notional (% of equity), fractional
+     Kelly from realized trade history, remaining portfolio heat.
+
+Protections (Freqtrade-style circuit breakers, plus the ones it lacks):
+  - Daily loss halt with UTC-day rollover.
+  - Max drawdown halt (peak-to-trough on equity).
+  - Stoploss guard: N stop-loss exits within a window halts entries.
+  - Consecutive-loss cooldown.
+  - Per-symbol cooldown after any exit (no instant re-entry).
+  - Correlation cap: refuses entries highly correlated with open exposure,
+    computed from actual return series, not hardcoded guesses.
+
+All state mutations happen through record_* / update_* methods so the same
+engine is reusable in live trading and in the backtester.
 """
 
-# mypy: ignore-errors
+from __future__ import annotations
 
-import asyncio
 import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
-from typing import Dict
-from datetime import datetime
-import math
+
+from ..models import Signal, TradeRecord, utc_now
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RiskDecision:
+    approved: bool
+    reason: str
+    quantity: float = 0.0
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+
+
+@dataclass
+class _ExitEvent:
+    symbol: str
+    timestamp: datetime
+    was_stop_loss: bool
+    pnl: float
+
+
+@dataclass
+class RiskState:
+    """Mutable state, separated so it can be snapshotted/inspected."""
+
+    equity: float = 0.0
+    peak_equity: float = 0.0
+    daily_pnl: float = 0.0
+    daily_anchor: Optional[datetime] = None  # start of current UTC day
+    consecutive_losses: int = 0
+    halted_until: Optional[datetime] = None
+    halt_reason: str = ""
+    exits: List[_ExitEvent] = field(default_factory=list)
 
 
 class RiskManager:
-    """
-    Advanced risk management system with multiple risk controls
-    """
+    def __init__(self, config: Optional[dict] = None):
+        cfg = dict(config or {})
+        # Sizing
+        self.risk_per_trade = float(cfg.get("risk_per_trade", 0.0075))
+        self.max_position_pct = float(cfg.get("max_position_pct", 0.20))
+        self.max_portfolio_heat = float(cfg.get("max_portfolio_heat", 0.05))
+        self.kelly_fraction = float(cfg.get("kelly_fraction", 0.5))
+        self.default_stop_atr_mult = float(cfg.get("default_stop_atr_mult", 2.0))
+        self.min_notional = float(cfg.get("min_notional", 10.0))
+        # Protections
+        self.max_daily_loss_pct = float(cfg.get("max_daily_loss_pct", 0.03))
+        self.max_drawdown_pct = float(cfg.get("max_drawdown_pct", 0.15))
+        self.stoploss_guard_count = int(cfg.get("stoploss_guard_count", 4))
+        self.stoploss_guard_window_h = float(cfg.get("stoploss_guard_window_hours", 24))
+        self.max_consecutive_losses = int(cfg.get("max_consecutive_losses", 5))
+        self.halt_cooldown_h = float(cfg.get("halt_cooldown_hours", 12))
+        self.reentry_cooldown_min = float(cfg.get("reentry_cooldown_minutes", 60))
+        # Correlation
+        self.correlation_threshold = float(cfg.get("correlation_threshold", 0.85))
+        self.correlation_lookback = int(cfg.get("correlation_lookback", 100))
 
-    def __init__(self, risk_config: Dict):
-        """
-        Initialize risk manager
+        self.state = RiskState()
+        self._returns: Dict[str, pd.Series] = {}
 
-        Args:
-            risk_config: Risk management configuration
-        """
-        self.risk_config = risk_config
-        self.logger = logging.getLogger(__name__)
+    # ------------------------------------------------------------------ #
+    # State feeds
+    # ------------------------------------------------------------------ #
 
-        # Risk metrics
-        self.portfolio_value = 100000.0  # Starting portfolio value
-        self.daily_pnl = 0.0
-        self.max_drawdown = 0.0
-        self.current_drawdown = 0.0
-        self.var_95 = 0.0  # Value at Risk 95%
+    def update_equity(self, equity: float, now: Optional[datetime] = None) -> None:
+        now = now or utc_now()
+        st = self.state
+        if st.daily_anchor is None or now.date() != st.daily_anchor.date():
+            # New UTC day: reset the daily loss budget.
+            st.daily_anchor = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            st.daily_pnl = 0.0
+        if st.equity > 0:
+            st.daily_pnl += equity - st.equity
+        st.equity = equity
+        st.peak_equity = max(st.peak_equity, equity)
 
-        # Position tracking
-        self.position_sizes = {}
-        self.correlation_matrix = pd.DataFrame()
-        self.volatility_data = {}
+    def update_returns(self, symbol: str, closes: pd.Series) -> None:
+        """Feed recent close prices so correlations use real data."""
+        tail = closes.tail(self.correlation_lookback + 1)
+        self._returns[symbol] = tail.pct_change().dropna()
 
-        # Risk limits
-        self.max_portfolio_risk = risk_config.get("max_portfolio_risk", 0.02)
-        self.max_position_size = risk_config.get("max_position_size", 0.1)
-        self.correlation_threshold = risk_config.get("correlation_threshold", 0.7)
-        self.drawdown_limit = risk_config.get("drawdown_limit", 0.1)
-        self.volatility_lookback = risk_config.get("volatility_lookback", 20)
+    def record_trade_result(
+        self, record: TradeRecord, was_stop_loss: bool, now: Optional[datetime] = None
+    ) -> None:
+        now = now or utc_now()
+        st = self.state
+        st.exits.append(
+            _ExitEvent(record.symbol, now, was_stop_loss, record.pnl)
+        )
+        # Keep the window bounded.
+        cutoff = now - timedelta(hours=max(self.stoploss_guard_window_h, 48))
+        st.exits = [e for e in st.exits if e.timestamp >= cutoff]
 
-    async def initialize(self):
-        """Initialize risk management system"""
-        self.logger.info("Initializing risk manager...")
+        if record.pnl < 0:
+            st.consecutive_losses += 1
+        else:
+            st.consecutive_losses = 0
 
-        try:
-            # Initialize correlation matrix
-            await self._initialize_correlation_matrix()
+        self._check_protections(now)
 
-            # Initialize volatility calculations
-            await self._initialize_volatility_data()
+    # ------------------------------------------------------------------ #
+    # Protections
+    # ------------------------------------------------------------------ #
 
-            self.logger.info("Risk manager initialized successfully")
+    def _halt(self, reason: str, now: datetime) -> None:
+        st = self.state
+        st.halted_until = now + timedelta(hours=self.halt_cooldown_h)
+        st.halt_reason = reason
+        logger.critical(
+            "TRADING HALTED until %s: %s", st.halted_until.isoformat(), reason
+        )
 
-        except Exception as e:
-            self.logger.error(f"Failed to initialize risk manager: {e}")
-            raise
+    def _check_protections(self, now: datetime) -> None:
+        st = self.state
+        window = now - timedelta(hours=self.stoploss_guard_window_h)
+        stop_hits = sum(
+            1 for e in st.exits if e.was_stop_loss and e.timestamp >= window
+        )
+        if stop_hits >= self.stoploss_guard_count:
+            self._halt(
+                f"stoploss guard: {stop_hits} stops in "
+                f"{self.stoploss_guard_window_h:.0f}h",
+                now,
+            )
+        if st.consecutive_losses >= self.max_consecutive_losses:
+            self._halt(f"{st.consecutive_losses} consecutive losses", now)
 
-    async def _initialize_correlation_matrix(self):
-        """Initialize correlation matrix for assets"""
-        try:
-            # Default symbols
-            symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT"]
+    def trading_allowed(self, now: Optional[datetime] = None) -> RiskDecision:
+        """Global gate — checked before any new entry."""
+        now = now or utc_now()
+        st = self.state
 
-            # Create identity matrix as default (no correlation)
-            self.correlation_matrix = pd.DataFrame(
-                np.eye(len(symbols)), index=symbols, columns=symbols
+        if st.halted_until is not None:
+            if now < st.halted_until:
+                return RiskDecision(False, f"halted: {st.halt_reason}")
+            st.halted_until = None
+            st.halt_reason = ""
+            st.consecutive_losses = 0
+            logger.info("Trading halt expired — entries re-enabled")
+
+        if st.equity > 0 and st.daily_pnl < -self.max_daily_loss_pct * st.equity:
+            return RiskDecision(
+                False,
+                f"daily loss limit: {st.daily_pnl:.2f} "
+                f"(limit {-self.max_daily_loss_pct * st.equity:.2f})",
             )
 
-        except Exception as e:
-            self.logger.error(f"Error initializing correlation matrix: {e}")
-
-    async def _initialize_volatility_data(self):
-        """Initialize volatility calculations"""
-        try:
-            symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT"]
-
-            for symbol in symbols:
-                self.volatility_data[symbol] = {
-                    "returns": [],
-                    "volatility": 0.02,  # Default 2% daily volatility
-                    "last_update": datetime.now(),
-                }
-
-        except Exception as e:
-            self.logger.error(f"Error initializing volatility data: {e}")
-
-    async def assess_trade(self, signal: Dict) -> Dict:
-        """
-        Assess trade risk and approve/reject
-
-        Args:
-            signal: Trading signal
-
-        Returns:
-            Risk assessment result
-        """
-        try:
-            symbol = signal["symbol"]
-            action = signal["action"]
-
-            # Check portfolio risk limits
-            portfolio_risk = await self.calculate_portfolio_risk()
-            if portfolio_risk > self.max_portfolio_risk:
-                return {
-                    "approved": False,
-                    "reason": f"Portfolio risk too high: {portfolio_risk:.3f} > {self.max_portfolio_risk:.3f}",
-                }
-
-            # Check drawdown limits
-            if self.current_drawdown > self.drawdown_limit:
-                return {
-                    "approved": False,
-                    "reason": f"Drawdown limit exceeded: {self.current_drawdown:.3f} > {self.drawdown_limit:.3f}",
-                }
-
-            # Check correlation limits for new positions
-            if action == "buy":
-                correlation_risk = await self._check_correlation_risk(symbol)
-                if correlation_risk > self.correlation_threshold:
-                    return {
-                        "approved": False,
-                        "reason": f"High correlation risk: {correlation_risk:.3f} > {self.correlation_threshold:.3f}",
-                    }
-
-            # Check volatility-adjusted risk
-            volatility_risk = await self._check_volatility_risk(symbol, signal)
-            if not volatility_risk["approved"]:
-                return volatility_risk
-
-            return {
-                "approved": True,
-                "reason": "Trade approved",
-                "risk_score": portfolio_risk,
-            }
-
-        except Exception as e:
-            self.logger.error(f"Error assessing trade risk: {e}")
-            return {"approved": False, "reason": f"Risk assessment error: {e}"}
-
-    async def calculate_position_size(self, signal: Dict) -> float:
-        """
-        Calculate optimal position size using Kelly Criterion and risk limits
-
-        Args:
-            signal: Trading signal
-
-        Returns:
-            Position size
-        """
-        try:
-            symbol = signal["symbol"]
-            confidence = signal["confidence"]
-
-            # Get volatility for the symbol
-            volatility = self.volatility_data.get(symbol, {}).get("volatility", 0.02)
-
-            # Kelly Criterion calculation
-            win_rate = confidence  # Use confidence as win rate proxy
-            avg_win = 0.02  # Average win 2%
-            avg_loss = 0.01  # Average loss 1%
-
-            kelly_fraction = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win
-            kelly_fraction = max(0, min(kelly_fraction, 0.25))  # Cap at 25%
-
-            # Volatility adjustment
-            vol_adjustment = 0.02 / volatility  # Target 2% volatility
-            vol_adjustment = min(vol_adjustment, 2.0)  # Cap adjustment
-
-            # Base position size
-            base_size = kelly_fraction * vol_adjustment
-
-            # Apply risk limits
-            max_size = self.max_position_size
-            position_size = min(base_size, max_size)
-
-            # Portfolio heat adjustment
-            portfolio_heat = await self._calculate_portfolio_heat()
-            if portfolio_heat > 0.5:  # If portfolio is more than 50% invested
-                position_size *= 1 - portfolio_heat
-
-            # Minimum position size
-            min_size = 0.001  # 0.1%
-            position_size = max(position_size, min_size)
-
-            self.logger.info(f"Position size calculated: {symbol} {position_size:.4f}")
-            return position_size
-
-        except Exception as e:
-            self.logger.error(f"Error calculating position size: {e}")
-            return 0.001  # Minimum size
-
-    async def calculate_portfolio_risk(self) -> float:
-        """
-        Calculate current portfolio risk (VaR)
-
-        Returns:
-            Portfolio risk as percentage
-        """
-        try:
-            if not self.position_sizes:
-                return 0.0
-
-            # Calculate individual position risks
-            position_risks = []
-            weights = []
-
-            for symbol, size in self.position_sizes.items():
-                volatility = self.volatility_data.get(symbol, {}).get(
-                    "volatility", 0.02
-                )
-                position_risk = size * volatility
-                position_risks.append(position_risk)
-                weights.append(size)
-
-            if not position_risks:
-                return 0.0
-
-            # Portfolio risk calculation with correlation
-            portfolio_variance = 0.0
-
-            for i, risk_i in enumerate(position_risks):
-                for j, risk_j in enumerate(position_risks):
-                    symbol_i = list(self.position_sizes.keys())[i]
-                    symbol_j = list(self.position_sizes.keys())[j]
-
-                    correlation = self._get_correlation(symbol_i, symbol_j)
-                    portfolio_variance += (
-                        weights[i] * weights[j] * risk_i * risk_j * correlation
-                    )
-
-            portfolio_risk = math.sqrt(portfolio_variance)
-            return portfolio_risk
-
-        except Exception as e:
-            self.logger.error(f"Error calculating portfolio risk: {e}")
-            return 0.0
-
-    async def _check_correlation_risk(self, symbol: str) -> float:
-        """
-        Check correlation risk for adding new position
-
-        Args:
-            symbol: Symbol to check
-
-        Returns:
-            Maximum correlation with existing positions
-        """
-        try:
-            if not self.position_sizes:
-                return 0.0
-
-            max_correlation = 0.0
-
-            for existing_symbol in self.position_sizes.keys():
-                correlation = self._get_correlation(symbol, existing_symbol)
-                max_correlation = max(max_correlation, abs(correlation))
-
-            return max_correlation
-
-        except Exception as e:
-            self.logger.error(f"Error checking correlation risk: {e}")
-            return 0.0
-
-    async def _check_volatility_risk(self, symbol: str, signal: Dict) -> Dict:
-        """
-        Check volatility-based risk
-
-        Args:
-            symbol: Trading symbol
-            signal: Trading signal
-
-        Returns:
-            Volatility risk assessment
-        """
-        try:
-            volatility = self.volatility_data.get(symbol, {}).get("volatility", 0.02)
-
-            # High volatility threshold (5% daily)
-            high_vol_threshold = 0.05
-
-            if volatility > high_vol_threshold:
-                return {
-                    "approved": False,
-                    "reason": f"High volatility: {volatility:.3f} > {high_vol_threshold:.3f}",
-                }
-
-            return {"approved": True, "reason": "Volatility risk acceptable"}
-
-        except Exception as e:
-            self.logger.error(f"Error checking volatility risk: {e}")
-            return {"approved": False, "reason": f"Volatility check error: {e}"}
-
-    async def _calculate_portfolio_heat(self) -> float:
-        """
-        Calculate portfolio heat (percentage of capital deployed)
-
-        Returns:
-            Portfolio heat as percentage
-        """
-        try:
-            total_exposure = sum(self.position_sizes.values())
-            return min(total_exposure, 1.0)
-
-        except Exception as e:
-            self.logger.error(f"Error calculating portfolio heat: {e}")
-            return 0.0
-
-    def _get_correlation(self, symbol1: str, symbol2: str) -> float:
-        """
-        Get correlation between two symbols
-
-        Args:
-            symbol1: First symbol
-            symbol2: Second symbol
-
-        Returns:
-            Correlation coefficient
-        """
-        try:
-            if symbol1 == symbol2:
-                return 1.0
-
-            if (
-                symbol1 in self.correlation_matrix.index
-                and symbol2 in self.correlation_matrix.columns
-            ):
-                return self.correlation_matrix.loc[symbol1, symbol2]
-
-            # Default correlation for crypto pairs
-            if "BTC" in symbol1 and "BTC" in symbol2:
-                return 1.0
-            elif ("BTC" in symbol1 or "BTC" in symbol2) and (
-                "ETH" in symbol1 or "ETH" in symbol2
-            ):
-                return 0.7  # BTC-ETH correlation
-            else:
-                return 0.5  # Default moderate correlation
-
-        except Exception as e:
-            self.logger.error(f"Error getting correlation: {e}")
-            return 0.5
-
-    async def update_market_data(self, market_data: Dict):
-        """
-        Update risk calculations with new market data
-
-        Args:
-            market_data: Latest market data
-        """
-        try:
-            prices = market_data.get("prices", {})
-
-            for symbol, price_data in prices.items():
-                await self._update_volatility(symbol, price_data)
-
-            # Update correlation matrix periodically
-            await self._update_correlation_matrix()
-
-        except Exception as e:
-            self.logger.error(f"Error updating market data: {e}")
-
-    async def _update_volatility(self, symbol: str, price_data: Dict):
-        """
-        Update volatility calculation for a symbol
-
-        Args:
-            symbol: Trading symbol
-            price_data: Price data
-        """
-        try:
-            if symbol not in self.volatility_data:
-                self.volatility_data[symbol] = {
-                    "returns": [],
-                    "volatility": 0.02,
-                    "last_price": price_data.get("price", 0),
-                    "last_update": datetime.now(),
-                }
-                return
-
-            vol_data = self.volatility_data[symbol]
-            current_price = price_data.get("price", 0)
-            last_price = vol_data.get("last_price", current_price)
-
-            if last_price > 0 and current_price > 0:
-                # Calculate return
-                return_pct = (current_price - last_price) / last_price
-
-                # Add to returns list
-                vol_data["returns"].append(return_pct)
-
-                # Keep only recent returns
-                if len(vol_data["returns"]) > self.volatility_lookback:
-                    vol_data["returns"].pop(0)
-
-                # Calculate volatility (standard deviation of returns)
-                if len(vol_data["returns"]) >= 5:
-                    returns_array = np.array(vol_data["returns"])
-                    volatility = np.std(returns_array) * math.sqrt(
-                        1440
-                    )  # Annualized (1440 minutes per day)
-                    vol_data["volatility"] = volatility
-
-                vol_data["last_price"] = current_price
-                vol_data["last_update"] = datetime.now()
-
-        except Exception as e:
-            self.logger.error(f"Error updating volatility for {symbol}: {e}")
-
-    async def _update_correlation_matrix(self):
-        """Update correlation matrix with recent price data"""
-        try:
-            # This would calculate correlations from recent price data
-            # For now, use static correlations
-            pass
-
-        except Exception as e:
-            self.logger.error(f"Error updating correlation matrix: {e}")
-
-    async def update_position(self, symbol: str, position_size: float):
-        """
-        Update position size tracking
-
-        Args:
-            symbol: Trading symbol
-            position_size: New position size
-        """
-        try:
-            if position_size > 0:
-                self.position_sizes[symbol] = position_size
-            else:
-                self.position_sizes.pop(symbol, None)
-
-        except Exception as e:
-            self.logger.error(f"Error updating position: {e}")
-
-    async def update_pnl(self, pnl: float):
-        """
-        Update P&L and drawdown calculations
-
-        Args:
-            pnl: Profit/Loss amount
-        """
-        try:
-            self.daily_pnl += pnl
-
-            # Update portfolio value
-            self.portfolio_value += pnl
-
-            # Calculate drawdown
-            if self.portfolio_value > self.max_drawdown:
-                self.max_drawdown = self.portfolio_value
-                self.current_drawdown = 0.0
-            else:
-                self.current_drawdown = (
-                    self.max_drawdown - self.portfolio_value
-                ) / self.max_drawdown
-
-        except Exception as e:
-            self.logger.error(f"Error updating P&L: {e}")
-
-    def get_risk_metrics(self) -> Dict:
-        """
-        Get current risk metrics
-
-        Returns:
-            Dictionary of risk metrics
-        """
-        try:
-            return {
-                "portfolio_value": self.portfolio_value,
-                "daily_pnl": self.daily_pnl,
-                "max_drawdown": self.max_drawdown,
-                "current_drawdown": self.current_drawdown,
-                "portfolio_risk": asyncio.run(self.calculate_portfolio_risk()),
-                "portfolio_heat": asyncio.run(self._calculate_portfolio_heat()),
-                "active_positions": len(self.position_sizes),
-                "var_95": self.var_95,
-            }
-
-        except Exception as e:
-            self.logger.error(f"Error getting risk metrics: {e}")
-            return {}
-
-    async def emergency_risk_check(self) -> Dict:
-        """
-        Emergency risk check for immediate action
-
-        Returns:
-            Emergency risk assessment
-        """
-        try:
-            actions = []
-
-            # Check drawdown
-            if self.current_drawdown > self.drawdown_limit:
-                actions.append(
-                    {
-                        "action": "close_all_positions",
-                        "reason": f"Drawdown limit exceeded: {self.current_drawdown:.3f}",
-                    }
+        if st.peak_equity > 0:
+            drawdown = (st.peak_equity - st.equity) / st.peak_equity
+            if drawdown > self.max_drawdown_pct:
+                return RiskDecision(
+                    False,
+                    f"max drawdown breached: {drawdown:.1%} > "
+                    f"{self.max_drawdown_pct:.1%}",
                 )
 
-            # Check portfolio risk
-            portfolio_risk = await self.calculate_portfolio_risk()
-            if portfolio_risk > self.max_portfolio_risk * 2:  # 2x normal limit
-                actions.append(
-                    {
-                        "action": "reduce_positions",
-                        "reason": f"Extreme portfolio risk: {portfolio_risk:.3f}",
-                    }
-                )
+        return RiskDecision(True, "ok")
 
-            return {"emergency": len(actions) > 0, "actions": actions}
+    def _symbol_in_cooldown(self, symbol: str, now: datetime) -> bool:
+        cutoff = now - timedelta(minutes=self.reentry_cooldown_min)
+        return any(
+            e.symbol == symbol and e.timestamp >= cutoff for e in self.state.exits
+        )
 
-        except Exception as e:
-            self.logger.error(f"Error in emergency risk check: {e}")
-            return {"emergency": False, "actions": []}
+    def _max_correlation_with_open(
+        self, symbol: str, open_symbols: List[str]
+    ) -> Optional[float]:
+        base = self._returns.get(symbol)
+        if base is None or len(base) < 20:
+            return None
+        worst = None
+        for other in open_symbols:
+            if other == symbol:
+                continue
+            series = self._returns.get(other)
+            if series is None or len(series) < 20:
+                continue
+            joined = pd.concat([base, series], axis=1, join="inner").dropna()
+            if len(joined) < 20:
+                continue
+            corr = float(joined.iloc[:, 0].corr(joined.iloc[:, 1]))
+            if not np.isnan(corr):
+                worst = corr if worst is None else max(worst, corr)
+        return worst
+
+    def _kelly_cap(self) -> float:
+        """Fractional-Kelly cap on position notional (as fraction of equity),
+        estimated from realized trade history. Neutral until enough data."""
+        pnls = [e.pnl for e in self.state.exits]
+        if len(pnls) < 10:
+            return self.max_position_pct
+        wins = [p for p in pnls if p > 0]
+        losses = [-p for p in pnls if p < 0]
+        if not wins or not losses:
+            return self.max_position_pct
+        win_rate = len(wins) / len(pnls)
+        avg_win = float(np.mean(wins))
+        avg_loss = float(np.mean(losses))
+        if avg_loss <= 0:
+            return self.max_position_pct
+        b = avg_win / avg_loss
+        kelly = win_rate - (1 - win_rate) / b
+        kelly = max(0.0, kelly) * self.kelly_fraction
+        # Kelly of 0 (negative edge) still allows the floor of one minimum
+        # position so the estimate can keep updating.
+        return float(np.clip(kelly, 0.02, self.max_position_pct))
+
+    # ------------------------------------------------------------------ #
+    # Sizing
+    # ------------------------------------------------------------------ #
+
+    def evaluate_entry(
+        self,
+        signal: Signal,
+        equity: float,
+        open_positions: Dict[str, float],
+        atr: Optional[float] = None,
+        max_open_positions: int = 5,
+        now: Optional[datetime] = None,
+    ) -> RiskDecision:
+        """Full entry gate + position size.
+
+        open_positions maps symbol -> current notional (quote currency).
+        """
+        now = now or utc_now()
+
+        gate = self.trading_allowed(now)
+        if not gate.approved:
+            return gate
+
+        if signal.symbol in open_positions:
+            return RiskDecision(False, f"already holding {signal.symbol}")
+        if len(open_positions) >= max_open_positions:
+            return RiskDecision(False, f"max open positions ({max_open_positions})")
+        if self._symbol_in_cooldown(signal.symbol, now):
+            return RiskDecision(
+                False, f"{signal.symbol} in re-entry cooldown"
+            )
+
+        corr = self._max_correlation_with_open(
+            signal.symbol, list(open_positions.keys())
+        )
+        if corr is not None and corr > self.correlation_threshold:
+            return RiskDecision(
+                False,
+                f"correlation {corr:.2f} with open positions exceeds "
+                f"{self.correlation_threshold:.2f}",
+            )
+
+        price = signal.price
+        if price <= 0 or equity <= 0:
+            return RiskDecision(False, "invalid price or equity")
+
+        # Stop distance: prefer the strategy's stop, fall back to ATR.
+        if signal.stop_loss and signal.stop_loss < price:
+            stop_distance = price - signal.stop_loss
+            stop_loss = signal.stop_loss
+        elif atr and atr > 0:
+            stop_distance = self.default_stop_atr_mult * atr
+            stop_loss = price - stop_distance
+        else:
+            return RiskDecision(False, "no stop level and no ATR available")
+
+        risk_budget = equity * self.risk_per_trade * max(signal.confidence, 0.25)
+        quantity = risk_budget / stop_distance
+
+        # Cap 1: max notional per position (Kelly-adjusted).
+        notional_cap = equity * min(self.max_position_pct, self._kelly_cap())
+        quantity = min(quantity, notional_cap / price)
+
+        # Cap 2: portfolio heat. Each position risks ~risk_per_trade of its
+        # notional-implied budget, so total notional is capped at
+        # heat / risk-per-trade of equity (e.g. 5% / 0.75% ≈ 6.7x... bounded
+        # below by equity itself for spot accounts).
+        open_notional = sum(open_positions.values())
+        max_total_notional = min(
+            equity, equity * self.max_portfolio_heat / self.risk_per_trade
+        )
+        remaining_notional = max(0.0, max_total_notional - open_notional)
+        quantity = min(quantity, remaining_notional / price)
+
+        notional = quantity * price
+        if notional < self.min_notional:
+            return RiskDecision(
+                False,
+                f"position too small after caps: {notional:.2f} < "
+                f"{self.min_notional:.2f} min notional",
+            )
+
+        return RiskDecision(
+            True,
+            "approved",
+            quantity=quantity,
+            stop_loss=stop_loss,
+            take_profit=signal.take_profit,
+        )
+
+    def metrics(self) -> Dict[str, float]:
+        st = self.state
+        drawdown = (
+            (st.peak_equity - st.equity) / st.peak_equity if st.peak_equity > 0 else 0.0
+        )
+        return {
+            "equity": st.equity,
+            "peak_equity": st.peak_equity,
+            "daily_pnl": st.daily_pnl,
+            "drawdown": drawdown,
+            "consecutive_losses": st.consecutive_losses,
+            "halted": st.halted_until is not None,
+            "kelly_cap": self._kelly_cap(),
+        }

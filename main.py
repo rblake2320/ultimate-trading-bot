@@ -1,37 +1,210 @@
-"""
-Ultimate AI-Powered Crypto Trading Bot
-Main entry point for the trading system
+"""Ultimate Trading Bot — command-line interface.
+
+Commands:
+  trade      Run the bot (paper mode by default; live needs two-key opt-in)
+  backtest   Backtest a strategy on real exchange history
+  fetch      Download OHLCV history to CSV
+  status     Show journal performance summary
+
+Examples:
+  python main.py trade
+  python main.py backtest --symbols BTC/USD ETH/USD --days 365 --timeframe 4h
+  python main.py backtest --strategy momentum --days 180
+  python main.py fetch --symbols BTC/USD --days 90 --timeframe 1h
+  python main.py status
 """
 
-# mypy: ignore-errors
+from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
-from src.trading_bot.core import TradingBot
+import sys
+import time
+from pathlib import Path
+
 from src.config.settings import load_config
+from src.trading_bot.backtest.backtester import (
+    Backtester,
+    BacktestConfig,
+)
+from src.trading_bot.core import TradingBot
+from src.trading_bot.data.market_data_manager import MarketDataManager
+from src.trading_bot.persistence.journal import TradeJournal
+from src.trading_bot.strategies import build_strategy
 
 
-def main() -> None:
-    """Main entry point for the trading bot"""
-    # Load configuration
-    config = load_config()
-
-    # Setup logging
+def setup_logging(config: dict) -> None:
+    log_cfg = config.get("logging", {})
+    level = getattr(logging, str(log_cfg.get("level", "INFO")).upper(), logging.INFO)
+    handlers = [logging.StreamHandler()]
+    log_file = log_cfg.get("file")
+    if log_file:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=level,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        handlers=handlers,
     )
 
-    # Initialize and run the trading bot
-    bot = TradingBot(config)
 
+async def cmd_trade(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    if getattr(args, "live", False):
+        config["mode"] = "live"
+    setup_logging(config)
+    bot = TradingBot(config)
     try:
-        asyncio.run(bot.run())
+        await bot.run()
     except KeyboardInterrupt:
-        logging.info("Trading bot stopped by user")
-    except Exception as e:
-        logging.error(f"Trading bot crashed: {e}")
+        logging.info("Stopped by user")
+    return 0
+
+
+async def _fetch_history(config, symbols, timeframe, days, exchange_id=None):
+    data = MarketDataManager(
+        exchange_id=exchange_id or config["exchange"]["id"], timeframe=timeframe
+    )
+    await data.initialize()
+    since_ms = int((time.time() - days * 86400) * 1000)
+    frames = {}
+    try:
+        for symbol in symbols:
+            print(f"Fetching {symbol} {timeframe} history ({days}d)...")
+            df = await data.fetch_history(symbol, timeframe, since_ms)
+            print(f"  {len(df)} candles: {df.index[0]} -> {df.index[-1]}")
+            frames[symbol] = df
+    finally:
+        await data.close()
+    return frames
+
+
+async def cmd_backtest(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    setup_logging(config)
+
+    strategy_name = args.strategy or config["signals"]["strategy"]
+    strategy = build_strategy(
+        strategy_name, config["signals"].get("strategy_params")
+    )
+    frames = await _fetch_history(
+        config, args.symbols, args.timeframe, args.days, args.exchange
+    )
+
+    bt_config = BacktestConfig(
+        initial_cash=args.cash,
+        fee_rate=float(config["exchange"].get("taker_fee", 0.0026)),
+        max_open_positions=int(config["trading"]["max_open_positions"]),
+        risk=config.get("risk", {}),
+    )
+    result = Backtester(strategy, bt_config).run(frames)
+    print()
+    print(f"Strategy: {strategy_name} | symbols: {', '.join(args.symbols)}")
+    print(result.summary())
+    if args.trades:
+        print("\nLast trades:")
+        for t in result.trades[-args.trades:]:
+            print(
+                f"  {t.closed_at:%Y-%m-%d %H:%M} {t.symbol:<10} "
+                f"pnl {t.pnl:+10.2f}  ({t.exit_reason})"
+            )
+    return 0
+
+
+async def cmd_fetch(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    setup_logging(config)
+    frames = await _fetch_history(
+        config, args.symbols, args.timeframe, args.days, args.exchange
+    )
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for symbol, df in frames.items():
+        path = out_dir / f"{symbol.replace('/', '_')}_{args.timeframe}.csv"
+        df.to_csv(path)
+        print(f"Wrote {path} ({len(df)} rows)")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    db_path = config["journal"]["db_path"]
+    if not Path(db_path).exists():
+        print(f"No journal at {db_path} — the bot hasn't traded yet.")
+        return 1
+    journal = TradeJournal(db_path)
+    summary = journal.performance_summary()
+    print("== Journal summary ==")
+    print(f"  trades:    {summary['trades']}")
+    print(f"  total pnl: {summary['total_pnl']:+.2f}")
+    print(f"  fees:      {summary['total_fees']:.2f}")
+    print(f"  win rate:  {summary['win_rate']:.1%}")
+    print("\nRecent trades:")
+    for t in journal.recent_trades(10):
+        print(
+            f"  {t['closed_at'][:16]} {t['symbol']:<10} "
+            f"pnl {t['pnl']:+10.2f}  ({t['exit_reason']})"
+        )
+    journal.close()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="trading-bot", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--config", default="config.json", help="config file path")
+    sub = parser.add_subparsers(dest="command")
+
+    p_trade = sub.add_parser("trade", help="run the trading bot")
+    p_trade.add_argument(
+        "--live",
+        action="store_true",
+        help="enable live trading (also requires TRADING_BOT_LIVE=YES)",
+    )
+
+    p_bt = sub.add_parser("backtest", help="backtest on real exchange history")
+    p_bt.add_argument("--symbols", nargs="+", default=["BTC/USD"])
+    p_bt.add_argument("--timeframe", default="1h")
+    p_bt.add_argument("--days", type=int, default=365)
+    p_bt.add_argument("--cash", type=float, default=10_000.0)
+    p_bt.add_argument("--strategy", default=None, help="strategy name override")
+    p_bt.add_argument("--trades", type=int, default=0, help="print last N trades")
+    p_bt.add_argument(
+        "--exchange",
+        default=None,
+        help="history source (kraken serves only ~720 recent candles; "
+        "use coinbase or binanceus for deep history)",
+    )
+
+    p_fetch = sub.add_parser("fetch", help="download OHLCV history to CSV")
+    p_fetch.add_argument("--symbols", nargs="+", default=["BTC/USD"])
+    p_fetch.add_argument("--timeframe", default="1h")
+    p_fetch.add_argument("--days", type=int, default=90)
+    p_fetch.add_argument("--out", default="data/history")
+    p_fetch.add_argument("--exchange", default=None, help="history source override")
+
+    sub.add_parser("status", help="show journal performance summary")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    command = args.command or "trade"
+    if command == "trade":
+        return asyncio.run(cmd_trade(args))
+    if command == "backtest":
+        return asyncio.run(cmd_backtest(args))
+    if command == "fetch":
+        return asyncio.run(cmd_fetch(args))
+    if command == "status":
+        return cmd_status(args)
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
