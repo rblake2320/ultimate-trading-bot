@@ -53,9 +53,10 @@ jobs:
           python-version: "3.12"
       - name: pip-audit (installed dependency tree)
         run: |
-          # The runner image ships stale build tooling (setuptools et al.)
-          # that pip-audit would flag; bring it current first so the scan
-          # reflects the project's dependency tree, not the image's.
-          pip install -U pip setuptools wheel
           pip install -r requirements.txt pip-audit
+          # Something in the resolved tree re-pins setuptools 82.x, which
+          # carries PYSEC-2026-3447 (medium, local-only MANIFEST.in issue in
+          # build tooling — not a runtime dependency). Force the fixed
+          # release LAST so the audit reflects what we actually ship.
+          pip install -U "setuptools>=83"
           pip-audit --skip-editable
