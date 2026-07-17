@@ -1,5 +1,60 @@
 # Changelog
 
+## [Unreleased] - 2026-07-17
+
+Production-readiness pass driven by a 7-dimension adversarially-verified
+audit (55 confirmed findings).
+
+### Fixed
+- **Live double-order risk**: LiveBroker no longer blind-retries after a
+  network timeout — orders carry a `clientOrderId` and every retry first
+  searches the venue for the accepted order.
+- **Stopless positions**: entries that fill asynchronously via the poll
+  loop now receive the risk decision's stop-loss/take-profit (previously
+  only synchronous fills did).
+- **Duplicate close orders**: the stop/take-profit check no longer re-fires
+  a full-size sell every 10s while a close order is still working.
+- **Loop error isolation**: one failing ticker no longer aborts stop checks
+  for the remaining positions; one failing emergency close no longer
+  abandons the rest.
+- Live `TradeRecord.pnl` is now fee-inclusive, matching the backtester
+  (Kelly sizing and loss halts previously ran on rosier numbers live).
+- `trade --live` re-validates the config, so the flag cannot bypass
+  live-mode API-key checks.
+- Paper orders rejected at cross time no longer leak in `open_orders`;
+  immediate fills are journaled once, not twice; dashboard port fallbacks
+  unified at 8899.
+
+### Security
+- Dashboard escapes all journal/exchange-derived strings (stored-XSS path
+  from hostile exchange responses), sends CSP/nosniff headers, pins the
+  Host header on loopback binds (DNS-rebinding), SRI-pins Chart.js, and
+  warns loudly on non-loopback binds. Telegram/Discord secrets are
+  redacted from notification failure logs. Docker container runs as a
+  non-root user.
+
+### Performance
+- Position/maintenance/signal/status paths fetch prices via one batched
+  `fetch_tickers` call instead of per-symbol requests behind the venue
+  rate limiter — stop-loss latency no longer scales with position count.
+
+### Added
+- 30 offline tests (76 → 106) covering the previously untested safety
+  gates: two-key live gate, stop propagation, single-shot closes,
+  LiveBroker idempotency, closed-candle invariant, risk rejection
+  branches, settings validation, LLM fail-open (moved into the gating
+  suite).
+- CI: least-privilege token, concurrency groups, Python 3.13, coverage
+  reporting, pip-audit job, pinned ruff. Dependabot for pip, actions, and
+  docker. `.dockerignore`, `.env.example`, Docker `HEALTHCHECK`/`EXPOSE`,
+  `DASHBOARD_HOST`/`DASHBOARD_PORT` env overrides.
+
+### Known gaps (need a human design decision — see todo.md)
+- No position/state reconstruction on restart: pre-existing live positions
+  become unmanaged.
+- Backtester fill-model optimism (gap-through stops fill at the stop
+  price; entry-bar stops skipped; sizing marks at fill-bar close).
+
 ## [1.0.0] - 2026-07-02
 
 Ground-up rebuild. The previous version could not run: `core.py` imported

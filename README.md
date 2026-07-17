@@ -93,8 +93,14 @@ python main.py status
 ```
 
 Configuration: copy `config.example.json` to `config.json` and edit.
-Secrets belong in the environment (`EXCHANGE_API_KEY`, `EXCHANGE_API_SECRET`,
-`TELEGRAM_BOT_TOKEN`, ...), never in the file.
+Secrets belong in the environment, never in the file — the full env-var
+contract (exchange keys, Robinhood keypair, notification tokens,
+`DASHBOARD_HOST`/`DASHBOARD_PORT`, the `TRADING_BOT_LIVE` gate) is
+documented in [.env.example](.env.example).
+
+The dashboard has **no authentication**. It binds `127.0.0.1` by default;
+if you bind anything else (e.g. `DASHBOARD_HOST=0.0.0.0` for Docker `-p`
+mapping), put an authenticating reverse proxy in front of it.
 
 ### Going live (only after paper trading works for you)
 
@@ -113,7 +119,7 @@ endpoint only serves the most recent ~720 candles — backtest against
 ## Architecture
 
 ```
-main.py                       CLI: trade | backtest | fetch | status
+main.py                       CLI: trade | backtest | fetch | status | dashboard | keygen
 src/config/settings.py       defaults < config.json < environment
 src/trading_bot/
   core.py                    engine: candle loop, position loop, kill switch
@@ -136,8 +142,11 @@ tests/                       real-data test suite (committed 400d of 1h OHLCV)
 ## Testing
 
 The suite uses **real market data** (400 days of Binance.US 1h candles,
-committed under `tests/data/`) and real components — no mocks. Live
-integration tests hit exchange public APIs and a local Ollama if present.
+committed under `tests/data/`) and real components — no mocks (one
+documented exception: the LiveBroker lost-response idempotency tests use a
+scripted venue, because a real exchange can't be asked to drop responses).
+Live integration tests hit exchange public APIs and a local Ollama if
+present. CI gates on the offline suite plus lint and `pip-audit`.
 
 ```bash
 pytest -q                      # everything
