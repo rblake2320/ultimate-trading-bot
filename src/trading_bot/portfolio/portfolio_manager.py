@@ -87,7 +87,10 @@ class PortfolioManager:
                 entry_price=position.entry_price,
                 exit_price=price,
                 size=closed_size,
-                pnl=position.realized_pnl,
+                # Fee-inclusive, matching the backtester — otherwise the live
+                # Kelly sizing and loss-streak halts run on rosier numbers
+                # than the backtest that validated them.
+                pnl=position.realized_pnl - position.fees_paid,
                 fees=position.fees_paid,
                 strategy=position.strategy or strategy,
                 exit_reason=order.reason,

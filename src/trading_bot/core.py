@@ -18,7 +18,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 
@@ -57,6 +57,12 @@ class TradingBot:
             s: None for s in self.symbols
         }
         self._market_cache: list = []
+        # Protective levels for entry orders that fill asynchronously (via the
+        # poll loop) — without this, poll-filled positions would run stopless.
+        self._pending_protection: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+        # symbol -> order id of an in-flight close, so the stop check can't
+        # re-fire a second full-size sell while the first is still working.
+        self._closing: Dict[str, str] = {}
 
         # Components are wired in setup() because live/paper differ.
         self.exchange_manager: Optional[ExchangeManager] = None
@@ -173,7 +179,7 @@ class TradingBot:
                 journal=self.journal,
                 bot=self,
                 host=dash_cfg.get("host", "127.0.0.1"),
-                port=int(dash_cfg.get("port", 8080)),
+                port=int(dash_cfg.get("port", 8899)),
             )
             try:
                 url = await self.dashboard.start()
@@ -249,6 +255,23 @@ class TradingBot:
                 logger.error("Candle loop error: %s", exc, exc_info=True)
             await asyncio.sleep(self.poll_seconds)
 
+    async def _poll_and_apply_fills(self) -> None:
+        """Sync open orders and book any fills, attaching the protective
+        levels remembered at submission time."""
+        filled = await self.orders.poll_open_orders()
+        for order in filled:
+            stop, target = self._pending_protection.pop(order.id, (None, None))
+            if self._closing.get(order.symbol) == order.id:
+                del self._closing[order.symbol]
+            self._apply_fill(order, stop=stop, target=target)
+        # Orders that died without filling (cancelled/rejected/stale)
+        # take their bookkeeping with them.
+        active = set(self.orders.orders)
+        self._pending_protection = {
+            k: v for k, v in self._pending_protection.items() if k in active
+        }
+        self._closing = {s: oid for s, oid in self._closing.items() if oid in active}
+
     async def _position_loop(self) -> None:
         """Stop-loss / take-profit / trailing-stop checks on live prices,
         plus open-order polling."""
@@ -258,29 +281,48 @@ class TradingBot:
                     await self.emergency_shutdown("kill file detected")
                     return
 
-                filled = await self.orders.poll_open_orders()
-                for order in filled:
-                    self._apply_fill(order)
+                await self._poll_and_apply_fills()
 
+                prices = await self.data.get_current_prices(
+                    list(self.portfolio.positions)
+                )
                 for symbol in list(self.portfolio.positions):
-                    position = self.portfolio.positions[symbol]
-                    price = await self.data.get_current_price(symbol)
-                    position.high_water_mark = max(
-                        position.high_water_mark, price
-                    )
-                    if self.trailing_stop_pct > 0:
-                        trailed = position.high_water_mark * (
-                            1 - self.trailing_stop_pct
+                    try:
+                        position = self.portfolio.positions.get(symbol)
+                        if position is None or symbol in self._closing:
+                            continue
+                        price = prices.get(symbol)
+                        if price is None:
+                            continue  # isolated fetch failure — next cycle retries
+                        position.high_water_mark = max(
+                            position.high_water_mark, price
                         )
-                        if position.stop_loss is None or trailed > position.stop_loss:
-                            position.stop_loss = trailed
-                    if position.stop_loss is not None and price <= position.stop_loss:
-                        await self._close_position(symbol, "stop_loss")
-                    elif (
-                        position.take_profit is not None
-                        and price >= position.take_profit
-                    ):
-                        await self._close_position(symbol, "take_profit")
+                        if self.trailing_stop_pct > 0:
+                            trailed = position.high_water_mark * (
+                                1 - self.trailing_stop_pct
+                            )
+                            if (
+                                position.stop_loss is None
+                                or trailed > position.stop_loss
+                            ):
+                                position.stop_loss = trailed
+                        if (
+                            position.stop_loss is not None
+                            and price <= position.stop_loss
+                        ):
+                            await self._close_position(symbol, "stop_loss")
+                        elif (
+                            position.take_profit is not None
+                            and price >= position.take_profit
+                        ):
+                            await self._close_position(symbol, "take_profit")
+                    except Exception as exc:  # noqa: BLE001 - one symbol must not starve the rest
+                        logger.error(
+                            "Position check failed for %s: %s",
+                            symbol,
+                            exc,
+                            exc_info=True,
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Position loop error: %s", exc, exc_info=True)
             await asyncio.sleep(self.price_check_seconds)
@@ -289,9 +331,11 @@ class TradingBot:
         """Equity snapshots, health checks, risk-state logging."""
         while self.is_running:
             try:
-                prices = {}
-                for symbol in list(self.portfolio.positions):
-                    prices[symbol] = await self.data.get_current_price(symbol)
+                # equity() marks symbols missing from the dict at entry price,
+                # so an isolated ticker failure degrades gracefully.
+                prices = await self.data.get_current_prices(
+                    list(self.portfolio.positions)
+                )
                 equity = self.portfolio.equity(prices)
                 self.risk.update_equity(equity)
                 self.journal.snapshot_equity(
@@ -320,10 +364,9 @@ class TradingBot:
 
     async def _handle_signal(self, signal, df: pd.DataFrame) -> None:
         if signal.action == SignalAction.BUY:
-            prices = {
-                s: await self.data.get_current_price(s)
-                for s in self.portfolio.positions
-            }
+            prices = await self.data.get_current_prices(
+                list(self.portfolio.positions)
+            )
             equity = self.portfolio.equity(prices)
             decision = self.risk.evaluate_entry(
                 signal,
@@ -342,7 +385,6 @@ class TradingBot:
                 OrderType.MARKET,
                 reason=f"signal:{signal.strategy}",
             )
-            self.journal.record_order(order)
             if order.status == OrderStatus.FILLED:
                 self._apply_fill(order, stop=decision.stop_loss, target=decision.take_profit)
                 await self.notify.trade(
@@ -352,6 +394,15 @@ class TradingBot:
                     f"regime {signal.regime.value if signal.regime else '?'}, "
                     f"SL {decision.stop_loss:.2f})"
                 )
+            else:
+                self.journal.record_order(order)
+                if not order.is_closed:
+                    # Fill will arrive via the poll loop — keep the protective
+                    # levels so the position never runs stopless.
+                    self._pending_protection[order.id] = (
+                        decision.stop_loss,
+                        decision.take_profit,
+                    )
         elif signal.action in (SignalAction.SELL, SignalAction.CLOSE):
             if signal.symbol in self.portfolio.positions:
                 await self._close_position(signal.symbol, f"signal:{signal.strategy}")
@@ -375,6 +426,8 @@ class TradingBot:
         position = self.portfolio.positions.get(symbol)
         if position is None:
             return
+        if symbol in self._closing:
+            return  # a close order is already working — never sell twice
         order = await self.orders.submit(
             symbol,
             OrderSide.SELL,
@@ -390,10 +443,15 @@ class TradingBot:
                 if last.symbol == symbol:
                     pnl_msg = f" pnl={last.pnl:+.2f}"
             await self.notify.trade(f"CLOSE {symbol} ({reason}){pnl_msg}")
-        else:
+        elif order.is_closed:  # rejected or cancelled — position still open
             await self.notify.alert(
                 f"Failed to close {symbol}: order {order.status.value} — {order.reason}"
             )
+        else:
+            # Working asynchronously: the poll loop applies the fill and
+            # clears this guard.
+            self._closing[symbol] = order.id
+            self.journal.record_order(order)
 
     # ------------------------------------------------------------------ #
     # Emergency
@@ -404,9 +462,15 @@ class TradingBot:
         self.journal.log_event("critical", f"emergency shutdown: {reason}")
         try:
             await self.orders.cancel_all()
+            self._closing.clear()  # cancelled close orders will never fill
             if self.config.get("trading", {}).get("emergency_close_positions", True):
                 for symbol in list(self.portfolio.positions):
-                    await self._close_position(symbol, "emergency")
+                    try:
+                        await self._close_position(symbol, "emergency")
+                    except Exception as exc:  # noqa: BLE001 - close the REST even if one fails
+                        logger.critical(
+                            "Emergency close failed for %s: %s", symbol, exc
+                        )
             await self.notify.emergency(f"Bot shut down: {reason}")
         finally:
             self.is_running = False
@@ -441,9 +505,7 @@ class TradingBot:
         return self._market_cache
 
     async def status(self) -> Dict:
-        prices = {}
-        for symbol in list(self.portfolio.positions):
-            prices[symbol] = await self.data.get_current_price(symbol)
+        prices = await self.data.get_current_prices(list(self.portfolio.positions))
         return {
             "mode": self.mode,
             "running": self.is_running,

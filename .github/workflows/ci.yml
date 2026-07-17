@@ -5,21 +5,30 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt coverage
       - name: Unit tests (offline, real committed market data)
-        run: pytest -m "not integration" -q
+        run: coverage run -m pytest -m "not integration" -q
+      - name: Coverage report
+        run: coverage report --include="src/*" --show-missing
       - name: Integration tests (live exchange public APIs)
         # Public endpoints, no keys. Kraken occasionally rate-limits CI
         # runners, so this step is advisory rather than blocking.
@@ -28,9 +37,26 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      - run: pip install "ruff>=0.12,<0.13"
       - run: ruff check src/ main.py tests/
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: pip-audit (installed dependency tree)
+        run: |
+          pip install -r requirements.txt pip-audit
+          # Something in the resolved tree re-pins setuptools 82.x, which
+          # carries PYSEC-2026-3447 (medium, local-only MANIFEST.in issue in
+          # build tooling — not a runtime dependency). Force the fixed
+          # release LAST so the audit reflects what we actually ship.
+          pip install -U "setuptools>=83"
+          pip-audit --skip-editable

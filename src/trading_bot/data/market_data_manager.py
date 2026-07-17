@@ -174,22 +174,64 @@ class MarketDataManager:
     # Tickers
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _price_from_ticker(ticker: dict) -> float:
+        price = float(ticker.get("last") or ticker.get("close") or 0.0)
+        if price <= 0:
+            bid, ask = ticker.get("bid"), ticker.get("ask")
+            if bid and ask:
+                price = (float(bid) + float(ask)) / 2.0
+        return price
+
     async def get_current_price(self, symbol: str) -> float:
         """Last trade price with a short TTL cache to respect rate limits."""
         now = time.monotonic()
         cached = self._tickers.get(symbol)
         if cached and now - cached[1] < self.ticker_ttl:
             return cached[0]
-        ticker = await self._exchange.fetch_ticker(symbol)
-        price = float(ticker.get("last") or ticker.get("close") or 0.0)
-        if price <= 0:
-            bid, ask = ticker.get("bid"), ticker.get("ask")
-            if bid and ask:
-                price = (float(bid) + float(ask)) / 2.0
+        price = self._price_from_ticker(await self._exchange.fetch_ticker(symbol))
         if price <= 0:
             raise RuntimeError(f"No usable price in ticker for {symbol}")
         self._tickers[symbol] = (price, now)
         return price
+
+    async def get_current_prices(self, symbols: List[str]) -> Dict[str, float]:
+        """Prices for many symbols in ONE exchange call where supported.
+
+        Sequential per-symbol fetches sit behind the venue rate limiter
+        (~1 req/s), so stop-loss latency would scale linearly with open
+        positions. Symbols whose price cannot be obtained are omitted —
+        callers must treat a missing key as \"no price this cycle\"."""
+        now = time.monotonic()
+        out: Dict[str, float] = {}
+        missing: List[str] = []
+        for symbol in symbols:
+            cached = self._tickers.get(symbol)
+            if cached and now - cached[1] < self.ticker_ttl:
+                out[symbol] = cached[0]
+            else:
+                missing.append(symbol)
+        if len(missing) > 1:
+            try:
+                tickers = await self._exchange.fetch_tickers(missing)
+                for symbol in missing:
+                    ticker = tickers.get(symbol)
+                    if ticker is None:
+                        continue
+                    price = self._price_from_ticker(ticker)
+                    if price > 0:
+                        self._tickers[symbol] = (price, now)
+                        out[symbol] = price
+            except Exception as exc:  # noqa: BLE001 - not all venues batch tickers
+                logger.debug("fetch_tickers unsupported/failed (%s) — per-symbol", exc)
+        for symbol in missing:
+            if symbol in out:
+                continue
+            try:
+                out[symbol] = await self.get_current_price(symbol)
+            except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures
+                logger.warning("No price for %s this cycle: %s", symbol, exc)
+        return out
 
     @staticmethod
     def _summarize(symbol: str, ticker: dict) -> dict:

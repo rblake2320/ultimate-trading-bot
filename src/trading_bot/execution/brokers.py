@@ -145,8 +145,10 @@ class PaperBroker(Broker):
             ) or (order.side == OrderSide.SELL and price >= order.price)
             if crossed:
                 # Resting maker order: fills at its limit price, maker fee.
+                # _settle may also REJECT (insufficient funds) — either way the
+                # order is closed and must leave the book.
                 self._settle(order, order.amount, order.price, self.maker_fee)
-                if order.status == OrderStatus.FILLED:
+                if order.is_closed:
                     del self.open_orders[order.id]
                 order.updated_at = utc_now()
         return order
@@ -216,7 +218,14 @@ class LiveBroker(Broker):
         for attempt in range(1, self.max_retries + 1):
             try:
                 raw = await self.exchange.create_order(
-                    order.symbol, order.type.value, order.side.value, amount, price
+                    order.symbol,
+                    order.type.value,
+                    order.side.value,
+                    amount,
+                    price,
+                    # Idempotency key: if a response is lost, the resting order
+                    # can be found again instead of placed again.
+                    {"clientOrderId": order.id},
                 )
                 self._apply(order, raw)
                 return order
@@ -231,6 +240,18 @@ class LiveBroker(Broker):
                     wait,
                 )
                 await asyncio.sleep(wait)
+                # A timeout does NOT mean the order failed — the exchange may
+                # have accepted it and only the response was lost. Re-sending
+                # blindly is how bots double-buy. Look for it first.
+                existing = await self._find_by_client_id(order)
+                if existing is not None:
+                    logger.warning(
+                        "Order %s was accepted by the exchange despite the "
+                        "network error — recovered, not re-sent",
+                        order.id,
+                    )
+                    self._apply(order, existing)
+                    return order
             except ccxt.ExchangeError as exc:
                 order.status = OrderStatus.REJECTED
                 order.reason += f" | exchange error: {exc}"
@@ -240,6 +261,31 @@ class LiveBroker(Broker):
         order.status = OrderStatus.REJECTED
         order.reason += f" | network failure after {self.max_retries} retries: {last_error}"
         return order
+
+    async def _find_by_client_id(self, order: Order) -> Optional[dict]:
+        """Search the venue for an order carrying our clientOrderId. Returns
+        the raw ccxt order dict, or None if it genuinely never arrived."""
+        try:
+            has = getattr(self.exchange, "has", {}) or {}
+            if has.get("fetchOrder"):
+                try:
+                    raw = await self.exchange.fetch_order(
+                        None, order.symbol, {"clientOrderId": order.id}
+                    )
+                    if raw:
+                        return raw
+                except Exception:  # noqa: BLE001 - not all venues support lookup by client id
+                    pass
+            for fetcher in ("fetch_open_orders", "fetch_closed_orders"):
+                flag = "fetchOpenOrders" if "open" in fetcher else "fetchClosedOrders"
+                if not has.get(flag):
+                    continue
+                for raw in await getattr(self.exchange, fetcher)(order.symbol):
+                    if raw.get("clientOrderId") == order.id:
+                        return raw
+        except Exception as exc:  # noqa: BLE001 - lookup is best-effort
+            logger.warning("clientOrderId lookup failed for %s: %s", order.id, exc)
+        return None
 
     def _apply(self, order: Order, raw: dict) -> None:
         order.exchange_order_id = raw.get("id")

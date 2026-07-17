@@ -42,7 +42,8 @@ class TestPortfolio:
             filled_order("BTC/USD", OrderSide.SELL, 0.1, 55_000.0, reason="take_profit")
         )
         assert record is not None
-        assert record.pnl == pytest.approx(500.0)
+        # Fee-inclusive PnL, matching the backtester: 500 gross - 2 in fees.
+        assert record.pnl == pytest.approx(498.0)
         assert record.fees == pytest.approx(2.0)
         assert "BTC/USD" not in pm.positions
         assert pm.cash == pytest.approx(10_000.0 - 5_001.0 + 5_499.0)
@@ -75,7 +76,7 @@ class TestPortfolio:
         stats = pm.stats()
         assert stats["closed_trades"] == 1
         assert stats["win_rate"] == 1.0
-        assert stats["total_pnl"] == pytest.approx(500.0)
+        assert stats["total_pnl"] == pytest.approx(498.0)  # net of 2.0 fees
 
 
 class TestJournal:

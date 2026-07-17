@@ -34,6 +34,20 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+# The inline page script needs 'unsafe-inline'; the real injection defense is
+# output escaping in index.html — CSP here blocks foreign script/connect
+# origins as depth. Chart.js is SRI-pinned in the HTML.
+CSP = (
+    "default-src 'none'; "
+    "script-src 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'unsafe-inline'; "
+    "connect-src 'self'; "
+    "img-src 'self' data:; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
+
 
 def parse_limit(request: web.Request, default: int, lo: int = 1, hi: int = 5000) -> int:
     """Validate the ?limit= query param: bad input gets a clean 400, not a
@@ -119,8 +133,23 @@ class Dashboard:
     # Lifecycle
     # ------------------------------------------------------------------ #
 
+    @web.middleware
+    async def _security_middleware(self, request: web.Request, handler):
+        # When bound to loopback, refuse requests whose Host header is not a
+        # loopback name: a malicious web page can't read responses cross-origin,
+        # but DNS rebinding defeats the same-origin check unless Host is pinned.
+        if self.host in LOOPBACK_HOSTS:
+            hostname = (request.host or "").rsplit(":", 1)[0].strip("[]").lower()
+            if hostname not in LOOPBACK_HOSTS:
+                raise web.HTTPForbidden(text="invalid Host header")
+        response = await handler(request)
+        response.headers["Content-Security-Policy"] = CSP
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
     def _build_app(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(middlewares=[self._security_middleware])
         app.router.add_get("/", self.index)
         app.router.add_get("/api/status", self.api_status)
         app.router.add_get("/api/equity", self.api_equity)
@@ -130,6 +159,13 @@ class Dashboard:
         return app
 
     async def start(self) -> str:
+        if self.host not in LOOPBACK_HOSTS:
+            logger.warning(
+                "Dashboard binding to %s — it has NO authentication. Anyone who "
+                "can reach this address can read positions, P&L, and events. "
+                "Put an authenticating reverse proxy in front of it.",
+                self.host,
+            )
         self._runner = web.AppRunner(self._build_app(), access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
