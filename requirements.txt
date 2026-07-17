@@ -1,16 +1,17 @@
 # Core — everything the bot needs to trade and backtest.
-# Floors exclude releases with published security advisories:
-# aiohttp < 3.10.11 (request smuggling / traversal CVEs), cryptography
-# < 42.0.4 (CVE-2024-26130). CI's pip-audit job gates the resolved tree.
+# Floors exclude every release with an open advisory in OSV as of
+# 2026-07-17 (cryptography < 48.0.1 carries two HIGH GHSAs; aiohttp and
+# pytest below the floors carry moderates). CI's pip-audit job gates the
+# resolved tree on every push.
 ccxt>=4.5.0
 pandas>=2.0.0
 numpy>=1.26.0
-aiohttp>=3.10.11
-cryptography>=42.0.4  # Ed25519 signing for the Robinhood Crypto adapter
+aiohttp>=3.14.1
+cryptography>=48.0.1  # Ed25519 signing for the Robinhood Crypto adapter
 
 # Testing
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
+pytest>=9.0.3
+pytest-asyncio>=1.0.0
 
 # Optional extras (uncomment as needed):
 # lightgbm>=4.0.0        # ML meta-filter training (future work; see docs)
