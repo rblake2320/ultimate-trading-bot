@@ -87,6 +87,8 @@ ENV_OVERRIDES = {
     "TELEGRAM_CHAT_ID": (("notifications", "telegram", "chat_id"), str),
     "DISCORD_WEBHOOK_URL": (("notifications", "discord", "webhook_url"), str),
     "TRADING_MODE": (("mode",), str),
+    "DASHBOARD_HOST": (("dashboard", "host"), str),
+    "DASHBOARD_PORT": (("dashboard", "port"), int),
 }
 
 
