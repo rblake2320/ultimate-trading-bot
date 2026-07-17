@@ -53,5 +53,9 @@ jobs:
           python-version: "3.12"
       - name: pip-audit (installed dependency tree)
         run: |
+          # The runner image ships stale build tooling (setuptools et al.)
+          # that pip-audit would flag; bring it current first so the scan
+          # reflects the project's dependency tree, not the image's.
+          pip install -U pip setuptools wheel
           pip install -r requirements.txt pip-audit
           pip-audit --skip-editable
