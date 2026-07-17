@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from src.config.settings import load_config
+from src.config.settings import load_config, validate_config
 from src.trading_bot.backtest.backtester import (
     BacktestConfig,
     Backtester,
@@ -53,6 +53,9 @@ async def cmd_trade(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     if getattr(args, "live", False):
         config["mode"] = "live"
+        # Re-validate: flipping the mode after load_config would otherwise
+        # skip the live-mode API-key checks.
+        validate_config(config)
     setup_logging(config)
     bot = TradingBot(config)
     try:
@@ -138,7 +141,7 @@ async def cmd_dashboard(args: argparse.Namespace) -> int:
     dashboard = Dashboard(
         journal=journal,
         host=dash_cfg.get("host", "127.0.0.1"),
-        port=int(args.port or dash_cfg.get("port", 8080)),
+        port=int(args.port or dash_cfg.get("port", 8899)),
     )
     url = await dashboard.start()
     print(f"Dashboard: {url}  (Ctrl+C to stop)")
