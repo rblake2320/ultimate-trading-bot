@@ -149,30 +149,6 @@ class TestLLMAnalystLive:
         assert verdict.verdict in ("approve", "veto")
         assert verdict.reasoning
 
-    def test_parse_verdict_json(self):
-        raw = 'Here you go: {"verdict": "veto", "confidence": 0.8, "reasoning": "RSI 92, parabolic"}'
-        verdict = LLMAnalyst._parse(raw)
-        assert verdict.is_veto
-        assert verdict.confidence == pytest.approx(0.8)
-
-    async def test_fails_open_when_unreachable(self, btc_df):
-        analyst = LLMAnalyst(
-            {
-                "enabled": True,
-                "provider": "ollama",
-                "ollama_url": "http://localhost:59999",  # nothing there
-                "timeout_seconds": 3,
-            }
-        )
-        from src.trading_bot.models import Signal, SignalAction
-
-        signal = Signal(
-            symbol="BTC/USDT",
-            action=SignalAction.BUY,
-            confidence=0.7,
-            price=100.0,
-            strategy="test",
-        )
-        verdict = await analyst.review(signal, btc_df)
-        assert verdict.verdict == "unavailable"
-        assert not verdict.is_veto
+    # NOTE: the deterministic analyst tests (JSON parsing, fail-open on an
+    # unreachable port) live in tests/test_llm_analyst.py — they need no
+    # network, so they run in the CI-gating suite, not here.

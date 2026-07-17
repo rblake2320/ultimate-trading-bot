@@ -255,6 +255,23 @@ class TradingBot:
                 logger.error("Candle loop error: %s", exc, exc_info=True)
             await asyncio.sleep(self.poll_seconds)
 
+    async def _poll_and_apply_fills(self) -> None:
+        """Sync open orders and book any fills, attaching the protective
+        levels remembered at submission time."""
+        filled = await self.orders.poll_open_orders()
+        for order in filled:
+            stop, target = self._pending_protection.pop(order.id, (None, None))
+            if self._closing.get(order.symbol) == order.id:
+                del self._closing[order.symbol]
+            self._apply_fill(order, stop=stop, target=target)
+        # Orders that died without filling (cancelled/rejected/stale)
+        # take their bookkeeping with them.
+        active = set(self.orders.orders)
+        self._pending_protection = {
+            k: v for k, v in self._pending_protection.items() if k in active
+        }
+        self._closing = {s: oid for s, oid in self._closing.items() if oid in active}
+
     async def _position_loop(self) -> None:
         """Stop-loss / take-profit / trailing-stop checks on live prices,
         plus open-order polling."""
@@ -264,23 +281,7 @@ class TradingBot:
                     await self.emergency_shutdown("kill file detected")
                     return
 
-                filled = await self.orders.poll_open_orders()
-                for order in filled:
-                    stop, target = self._pending_protection.pop(
-                        order.id, (None, None)
-                    )
-                    if self._closing.get(order.symbol) == order.id:
-                        del self._closing[order.symbol]
-                    self._apply_fill(order, stop=stop, target=target)
-                # Orders that died without filling (cancelled/rejected/stale)
-                # take their bookkeeping with them.
-                active = set(self.orders.orders)
-                self._pending_protection = {
-                    k: v for k, v in self._pending_protection.items() if k in active
-                }
-                self._closing = {
-                    s: oid for s, oid in self._closing.items() if oid in active
-                }
+                await self._poll_and_apply_fills()
 
                 prices = await self.data.get_current_prices(
                     list(self.portfolio.positions)

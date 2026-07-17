@@ -61,3 +61,54 @@ def test_bad_symbol_format_rejected():
     config["trading"]["symbols"] = ["BTCUSD"]
     with pytest.raises(ValueError, match="BASE/QUOTE"):
         validate_config(config)
+
+
+def test_empty_symbols_rejected():
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
+    config["trading"]["symbols"] = []
+    with pytest.raises(ValueError, match="must not be empty"):
+        validate_config(config)
+
+
+def test_max_open_positions_floor():
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
+    config["trading"]["max_open_positions"] = 0
+    with pytest.raises(ValueError, match="max_open_positions"):
+        validate_config(config)
+
+
+def test_live_robinhood_requires_env_keys(tmp_path, monkeypatch):
+    monkeypatch.delenv("ROBINHOOD_API_KEY", raising=False)
+    monkeypatch.delenv("ROBINHOOD_PRIVATE_KEY", raising=False)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"mode": "live", "exchange": {"id": "robinhood"}}))
+    with pytest.raises(ValueError, match="ROBINHOOD_API_KEY"):
+        load_config(str(path))
+    monkeypatch.setenv("ROBINHOOD_API_KEY", "k")
+    monkeypatch.setenv("ROBINHOOD_PRIVATE_KEY", "p")
+    assert load_config(str(path))["exchange"]["id"] == "robinhood"
+
+
+def test_trading_mode_env_cannot_bypass_key_checks(tmp_path, monkeypatch):
+    """TRADING_MODE=live alone must still fail closed on missing API keys —
+    a refactor reordering _apply_env/validate_config would break this
+    silently without the pin."""
+    monkeypatch.setenv("TRADING_MODE", "live")
+    for var in ("EXCHANGE_API_KEY", "EXCHANGE_API_SECRET"):
+        monkeypatch.delenv(var, raising=False)
+    with pytest.raises(ValueError, match="live mode requires"):
+        load_config(str(tmp_path / "missing.json"))
+
+
+def test_discord_auto_enables_on_webhook(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/x/y")
+    config = load_config(str(tmp_path / "missing.json"))
+    assert config["notifications"]["discord"]["enabled"] is True
+
+
+def test_dashboard_env_overrides(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_HOST", "0.0.0.0")
+    monkeypatch.setenv("DASHBOARD_PORT", "9001")
+    config = load_config(str(tmp_path / "missing.json"))
+    assert config["dashboard"]["host"] == "0.0.0.0"
+    assert config["dashboard"]["port"] == 9001

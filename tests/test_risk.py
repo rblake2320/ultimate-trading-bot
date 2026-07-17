@@ -194,3 +194,58 @@ def test_kelly_cap_shrinks_after_losing_history():
     for i in range(2):
         rm.record_trade_result(make_trade(+10.0, f"W{i}/USD"), False, now=NOW)
     assert rm._kelly_cap() == pytest.approx(0.02)
+
+
+def test_already_holding_rejected():
+    rm = RiskManager()
+    rm.update_equity(10_000.0, now=NOW)
+    decision = rm.evaluate_entry(
+        make_signal(symbol="BTC/USDT"), 10_000.0, {"BTC/USDT": 500.0}, now=NOW
+    )
+    assert not decision.approved
+    assert "already holding" in decision.reason
+
+
+def test_invalid_price_or_equity_rejected():
+    rm = RiskManager()
+    rm.update_equity(10_000.0, now=NOW)
+    assert not rm.evaluate_entry(
+        make_signal(price=0.0, stop=None), 10_000.0, {}, now=NOW
+    ).approved
+    assert not rm.evaluate_entry(make_signal(), 0.0, {}, now=NOW).approved
+
+
+def test_min_notional_rejects_dust_after_caps():
+    """The dust-order gate: caps can shrink a valid signal below the
+    exchange minimum — that order must never reach the venue."""
+    rm = RiskManager()  # min_notional default 10.0
+    rm.update_equity(40.0, now=NOW)
+    decision = rm.evaluate_entry(
+        make_signal(price=100.0, stop=98.0, conf=1.0), 40.0, {}, now=NOW
+    )
+    assert not decision.approved
+    assert "too small after caps" in decision.reason
+
+
+def test_kelly_cap_maxes_on_all_win_history():
+    rm = RiskManager({"max_position_pct": 0.20})
+    rm.update_equity(10_000.0, now=NOW)
+    for i in range(10):
+        rm.record_trade_result(make_trade(+20.0, f"W{i}/USD"), False, now=NOW)
+    assert rm._kelly_cap() == pytest.approx(0.20)
+
+
+def test_metrics_reports_live_state():
+    """core.py calls metrics() every maintenance cycle and the dashboard
+    renders it — it was never executed by any test."""
+    rm = RiskManager()
+    rm.update_equity(10_000.0, now=NOW)
+    rm.update_equity(9_000.0, now=NOW)
+    rm.record_trade_result(make_trade(-100.0), True, now=NOW)
+    m = rm.metrics()
+    assert m["equity"] == pytest.approx(9_000.0)
+    assert m["peak_equity"] == pytest.approx(10_000.0)
+    assert m["drawdown"] == pytest.approx(0.1)
+    assert m["consecutive_losses"] == 1
+    assert m["halted"] is False
+    assert 0.0 < m["kelly_cap"] <= 1.0
