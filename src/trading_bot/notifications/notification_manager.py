@@ -49,7 +49,17 @@ class NotificationManager:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception):
-                    logger.warning("Notification channel failed: %s", result)
+                    logger.warning(
+                        "Notification channel failed: %s", self._redact(str(result))
+                    )
+
+    def _redact(self, text: str) -> str:
+        """Exception text can embed the request URL, which carries the
+        Telegram token and the Discord webhook secret."""
+        for secret in (self.telegram_token, self.discord_webhook):
+            if secret:
+                text = text.replace(str(secret), "***")
+        return text
 
     async def trade(self, message: str) -> None:
         await self.send(f"[trade] {message}")

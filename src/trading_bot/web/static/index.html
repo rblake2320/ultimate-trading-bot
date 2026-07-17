@@ -4,7 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ultimate Trading Bot</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"
+        integrity="sha384-JUh163oCRItcbPme8pYnROHQMC6fNKTBWtRG3I3I0erJkzNgL7uxKlNwcrcFKeqF"
+        crossorigin="anonymous"></script>
 <style>
   :root {
     --bg: #0b0e14;
@@ -158,6 +160,10 @@ const fmt = (v, d = 2) =>
   v == null || isNaN(v) ? "—" :
   Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 const cls = v => (v > 0 ? "pos" : v < 0 ? "neg" : "");
+// Journal fields (event messages, exit reasons, symbols) can carry raw
+// exchange API response text — always escape before insertAdjacentHTML.
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 const REGIME_LABEL = {
   trending_up: ["▲ trend", "pos"], trending_down: ["▼ trend", "neg"],
@@ -179,15 +185,15 @@ async function refreshMarket() {
     for (const m of market) {
       if (m.error) {
         grid.insertAdjacentHTML("beforeend",
-          `<div class="card"><div class="label">${m.symbol}</div>
-           <div class="value neg" style="font-size:13px">${m.error}</div></div>`);
+          `<div class="card"><div class="label">${esc(m.symbol)}</div>
+           <div class="value neg" style="font-size:13px">${esc(m.error)}</div></div>`);
         continue;
       }
       const chg = m.change_24h_pct;
       const [rl, rc] = REGIME_LABEL[m.regime] || ["", ""];
       grid.insertAdjacentHTML("beforeend",
         `<div class="card">
-           <div class="label">${m.symbol}
+           <div class="label">${esc(m.symbol)}
              <span class="${rc}" style="float:right">${rl}</span></div>
            <div class="value">$${fmt(m.price, m.price < 10 ? 4 : 2)}</div>
            <div style="font-size:12px;margin-top:2px" class="${cls(chg)}">
@@ -267,7 +273,7 @@ async function refresh() {
     for (const s of psyms) {
       const p = positions[s];
       ptb.insertAdjacentHTML("beforeend",
-        `<tr><td>${s}</td><td>${fmt(p.size, 6)}</td><td>${fmt(p.entry)}</td>
+        `<tr><td>${esc(s)}</td><td>${fmt(p.size, 6)}</td><td>${fmt(p.entry)}</td>
          <td>${fmt(p.stop)}</td><td>${fmt(p.target)}</td>
          <td class="${cls(p.unrealized)}">${fmt(p.unrealized)}</td></tr>`);
     }
@@ -278,16 +284,16 @@ async function refresh() {
     for (const t of trades) {
       ttb.insertAdjacentHTML("beforeend",
         `<tr><td>${(t.closed_at || "").slice(0, 16).replace("T", " ")}</td>
-         <td>${t.symbol}</td><td>${fmt(t.size, 6)}</td><td>${fmt(t.entry_price)}</td>
+         <td>${esc(t.symbol)}</td><td>${fmt(t.size, 6)}</td><td>${fmt(t.entry_price)}</td>
          <td>${fmt(t.exit_price)}</td><td class="${cls(t.pnl)}">${fmt(t.pnl)}</td>
-         <td>${t.exit_reason || ""}</td></tr>`);
+         <td>${esc(t.exit_reason)}</td></tr>`);
     }
 
     const ev = document.getElementById("events");
     ev.innerHTML = events.length ? "" : '<div class="empty">no events</div>';
     for (const e of events) {
       ev.insertAdjacentHTML("beforeend",
-        `<div class="${e.level}"><span class="ts">${(e.timestamp || "").slice(5, 19).replace("T", " ")}</span>${e.message}</div>`);
+        `<div class="${esc(e.level)}"><span class="ts">${esc((e.timestamp || "").slice(5, 19).replace("T", " "))}</span>${esc(e.message)}</div>`);
     }
 
     if (equity.length) drawChart(equity);
